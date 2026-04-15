@@ -4,9 +4,11 @@ CSI Breathing Rate Analysis Tool
 =================================
 Processes ESP32 Wi-Fi CSI data for breathing rate estimation.
 
-Implements two methods:
+Implements three methods:
+  - Ratio (default): cross-subcarrier conjugate product against a high-SNR
+    reference cancels common-mode hardware phase noise; BoI selects the pair.
   - Amplitude: Band-of-Interest subcarrier selection on amplitude variance.
-  - Phase: Phase-difference based approach with linear detrending.
+  - Phase: phase-based approach with linear detrending.
 
 Data format: ESP32 CSI serial output from esp-csi/csi_recv_router.
 Each CSI frame = 128 bytes = 64 subcarriers, stored as [imag, real] pairs.
@@ -581,10 +583,40 @@ def resample_uniform(
     return resampled, t_uniform, actual_fs
 
 
+def cross_subcarrier_ratio(
+    csi_matrix: np.ndarray,
+    valid_mask: np.ndarray,
+) -> tuple:
+    """Compute conjugate product of every subcarrier against a reference.
+
+    For each valid subcarrier m:
+        R[t, m] = H[t, m] * conj(H[t, ref])
+
+    The product cancels common-mode hardware phase noise (CFO, SFO, random
+    per-packet phase offset) that is identical across all subcarriers, leaving
+    only the differential channel variation caused by motion/breathing.
+
+    The reference subcarrier is the valid subcarrier with the highest mean
+    amplitude (best SNR).
+
+    Returns:
+        ratio:   (T, M) complex array of conjugate products
+        ref_idx: index of the reference subcarrier
+    """
+    mean_amp = np.mean(np.abs(csi_matrix), axis=0)
+    mean_amp_valid = mean_amp.copy()
+    mean_amp_valid[~valid_mask] = 0
+    ref_idx = int(np.argmax(mean_amp_valid))
+
+    ref = csi_matrix[:, ref_idx]          # (T,)
+    ratio = csi_matrix * np.conj(ref[:, np.newaxis])  # (T, M)
+    return ratio, ref_idx
+
+
 def extract_breathing_signal(
     csi_matrix: np.ndarray,
     fs: float,
-    method: str = "amplitude",
+    method: str = "ratio",
     valid_mask: Optional[np.ndarray] = None,
 ) -> tuple:
     """Extract breathing signal from CSI matrix.
@@ -592,7 +624,7 @@ def extract_breathing_signal(
     Args:
         csi_matrix: (T, M) complex CSI matrix
         fs: sampling rate in Hz
-        method: 'amplitude' | 'phase'
+        method: 'ratio' | 'amplitude' | 'phase'
         valid_mask: boolean mask for valid subcarriers
 
     Returns:
@@ -603,7 +635,22 @@ def extract_breathing_signal(
     if valid_mask is None:
         valid_mask = get_valid_subcarrier_mask(M)
 
-    if method == "amplitude":
+    if method == "ratio":
+        # Cross-subcarrier ratio: cancel common-mode hardware phase noise,
+        # then pick the subcarrier pair with the strongest breathing signal.
+        ratio, ref_idx = cross_subcarrier_ratio(csi_matrix, valid_mask)
+
+        boi = compute_boi_scores(ratio, fs, freq_lo=BOI_FREQ_LO, freq_hi=BOI_FREQ_HI)
+        boi[~valid_mask] = 0
+        boi[ref_idx] = 0  # ratio of reference with itself is trivially zero
+
+        best_idx = int(np.argmax(boi))
+
+        # Phase of the ratio is the differential phase — robust to hardware offsets
+        phase_ratio = np.unwrap(np.angle(ratio[:, best_idx]))
+        breath_raw = phase_ratio - np.mean(phase_ratio)
+
+    elif method == "amplitude":
         # Pick the subcarrier with the highest Band-of-Interest score
         boi = compute_boi_scores(csi_matrix, fs, freq_lo=BOI_FREQ_LO, freq_hi=BOI_FREQ_HI)
         boi[~valid_mask] = 0
@@ -871,7 +918,7 @@ def plot_comprehensive_analysis(
     """Generate comprehensive visualization of CSI breathing analysis."""
 
     if methods is None:
-        methods = ["amplitude", "phase"]
+        methods = ["ratio", "amplitude", "phase"]
 
     csi_raw = dataset.csi_matrix()
     T_raw, M = csi_raw.shape
@@ -1010,6 +1057,7 @@ def plot_comprehensive_analysis(
     )
 
     method_colors = {
+        "ratio": "#2196F3",
         "amplitude": "#FF9800",
         "phase": "#9C27B0",
     }
@@ -1347,9 +1395,11 @@ def main():
 Examples:
     python csi_breathing.py CSI_DATA.txt
     python csi_breathing.py CSI_DATA.txt --output-dir results
-    python csi_breathing.py CSI_DATA.txt --methods amplitude phase
+    python csi_breathing.py CSI_DATA.txt --methods ratio amplitude phase
 
 Methods:
+    ratio        - Cross-subcarrier ratio: conjugate product against a reference
+                   subcarrier cancels hardware phase noise; BoI selects the best pair
     amplitude    - Band-of-Interest subcarrier selection on amplitude
     phase        - Phase-based with linear detrending
 
@@ -1368,8 +1418,8 @@ References:
         "--methods",
         "-m",
         nargs="+",
-        default=["amplitude", "phase"],
-        choices=["amplitude", "phase"],
+        default=["ratio", "amplitude", "phase"],
+        choices=["ratio", "amplitude", "phase"],
         help="Analysis methods to run",
     )
 

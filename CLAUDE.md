@@ -89,7 +89,8 @@ Single-connection TCP server. On each new connection it:
 
 ### Analysis (`csi_breathing.py`)
 
-Implements two approaches:
+Implements three approaches (default: ratio):
+- **Ratio**: cross-subcarrier conjugate product `H[t,m] * conj(H[t,ref])` against the highest-SNR subcarrier; cancels common-mode hardware phase noise; BoI picks the best pair.
 - **Amplitude**: Band-of-Interest (BoI) subcarrier selection based on amplitude variance.
 - **Phase**: phase-difference approach with linear detrending.
 
