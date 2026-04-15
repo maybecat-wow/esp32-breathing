@@ -4,10 +4,9 @@ CSI Breathing Rate Analysis Tool
 =================================
 Processes ESP32 Wi-Fi CSI data for breathing rate estimation.
 
-Implements methods inspired by:
-  - ComplexBeat (Li et al., IEEE SiPS 2021): CIR-domain processing with
-    amplitude/phase calibration and Band-of-Interest (BoI) subcarrier selection.
-  - PhaseBeat baseline: phase-difference based approach with DWT filtering.
+Implements two methods:
+  - Amplitude: Band-of-Interest subcarrier selection on amplitude variance.
+  - Phase: Phase-difference based approach with linear detrending.
 
 Data format: ESP32 CSI serial output from esp-csi/csi_recv_router.
 Each CSI frame = 128 bytes = 64 subcarriers, stored as [imag, real] pairs.
@@ -68,9 +67,6 @@ BREATH_FREQ_HI = 0.5  # 30 BPM upper bound
 # BoI score computation band
 BOI_FREQ_LO = 0.15
 BOI_FREQ_HI = 0.5
-
-# Delay filter: max delay spread (in taps)
-DELAY_FILTER_MAX_TAPS = 1  # ~50 ns at 20 MHz BW
 
 # Hampel filter parameters (for DC removal in phase)
 HAMPEL_WINDOW = 5  # seconds
@@ -506,113 +502,6 @@ def get_valid_subcarrier_mask(n_sub: int = 64) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Calibration (ComplexBeat-inspired)
-# ---------------------------------------------------------------------------
-
-
-def amplitude_calibration(csi_matrix: np.ndarray, D: int = 3) -> np.ndarray:
-    """Dominant-path amplitude calibration.
-
-    For each frame, estimate the dominant path power from the CIR,
-    then normalize CSI amplitudes to remove AGC/hardware gain variations.
-
-    |H_cal[t,m]| = |H[t,m]| / sqrt(mean_power_around_dominant_path)
-    """
-    T, M = csi_matrix.shape
-    calibrated = csi_matrix.copy()
-
-    for t in range(T):
-        # Compute CIR via IFFT
-        cir = np.fft.ifft(csi_matrix[t, :])
-        cir_power = np.abs(cir) ** 2
-
-        # Find dominant path (max power tap)
-        tau_star = np.argmax(cir_power)
-
-        # Average power around dominant path
-        indices = np.arange(max(0, tau_star - D), min(M, tau_star + D + 1))
-        if len(indices) == 0:
-            continue
-        avg_power = np.mean(cir_power[indices])
-
-        if avg_power > 0:
-            scale = 1.0 / avg_power
-            calibrated[t, :] = csi_matrix[t, :] * scale
-
-    return calibrated
-
-
-def phase_calibration_linear(csi_matrix: np.ndarray) -> np.ndarray:
-    """Linear phase offset calibration.
-
-    Estimates and removes the linear phase component (ξ_d * m + ξ_c)
-    caused by sampling frequency offset and timing offset.
-    Uses least-squares fit on subcarriers with strong amplitude.
-    """
-    T, M = csi_matrix.shape
-    calibrated = csi_matrix.copy()
-    subcarrier_indices = np.arange(M)
-
-    for t in range(T):
-        phase = np.angle(csi_matrix[t, :])
-        amplitude = np.abs(csi_matrix[t, :])
-
-        # Select subcarriers with amplitude above median for robust fit
-        amp_threshold = (
-            np.median(amplitude[amplitude > 0]) if np.any(amplitude > 0) else 0
-        )
-        strong_mask = amplitude > amp_threshold
-        if np.sum(strong_mask) < 3:
-            continue
-
-        # Unwrap phase for fitting
-        strong_indices = subcarrier_indices[strong_mask]
-        strong_phase = phase[strong_mask]
-
-        # Simple unwrap
-        strong_phase_unwrapped = np.unwrap(strong_phase)
-
-        # Least-squares linear fit: phase = alpha * m + beta
-        A = np.vstack([strong_indices, np.ones(len(strong_indices))]).T
-        result = np.linalg.lstsq(A, strong_phase_unwrapped, rcond=None)
-        alpha, beta = result[0]
-
-        # Remove linear component
-        linear_phase = alpha * subcarrier_indices + beta
-        calibrated[t, :] = csi_matrix[t, :] * np.exp(-1j * linear_phase)
-
-    return calibrated
-
-
-# ---------------------------------------------------------------------------
-# Delay-domain filtering (ComplexBeat)
-# ---------------------------------------------------------------------------
-
-
-def delay_filter(
-    csi_matrix: np.ndarray, max_taps: int = DELAY_FILTER_MAX_TAPS
-) -> np.ndarray:
-    """Apply delay-domain filter: keep CIR taps within ±max_taps, zero the rest.
-
-    This suppresses multipath components with large delays that are unlikely
-    to carry breathing information.
-    """
-    T, M = csi_matrix.shape
-    filtered = np.zeros_like(csi_matrix)
-
-    for t in range(T):
-        cir = np.fft.ifft(csi_matrix[t, :])
-        # Keep only taps 0..max_taps and (M-max_taps)..M-1
-        mask = np.zeros(M, dtype=bool)
-        mask[:max_taps] = True
-        mask[-max_taps:] = True
-        cir_filtered = cir * mask
-        filtered[t, :] = np.fft.fft(cir_filtered)
-
-    return filtered
-
-
-# ---------------------------------------------------------------------------
 # Signal extraction
 # ---------------------------------------------------------------------------
 
@@ -695,7 +584,7 @@ def resample_uniform(
 def extract_breathing_signal(
     csi_matrix: np.ndarray,
     fs: float,
-    method: str = "complexbeat",
+    method: str = "amplitude",
     valid_mask: Optional[np.ndarray] = None,
 ) -> tuple:
     """Extract breathing signal from CSI matrix.
@@ -703,7 +592,7 @@ def extract_breathing_signal(
     Args:
         csi_matrix: (T, M) complex CSI matrix
         fs: sampling rate in Hz
-        method: 'complexbeat' | 'amplitude' | 'phase'
+        method: 'amplitude' | 'phase'
         valid_mask: boolean mask for valid subcarriers
 
     Returns:
@@ -714,34 +603,12 @@ def extract_breathing_signal(
     if valid_mask is None:
         valid_mask = get_valid_subcarrier_mask(M)
 
-    if method == "complexbeat":
-        # ComplexBeat: amplitude calibration → phase calibration → delay filter
-        cal = amplitude_calibration(csi_matrix)
-        cal = phase_calibration_linear(cal)
-        cal = delay_filter(cal)
-
-        # Compute BoI scores on calibrated data
-        boi = compute_boi_scores(cal, fs)
+    if method == "amplitude":
+        # Pick the subcarrier with the highest Band-of-Interest score
+        boi = compute_boi_scores(csi_matrix, fs, freq_lo=BOI_FREQ_LO, freq_hi=BOI_FREQ_HI)
         boi[~valid_mask] = 0
 
-        # Fallback: if BoI scores are degenerate (all near zero), use variance
-        if np.max(boi) < 1e-10:
-            variances = np.var(np.abs(cal), axis=0)
-            variances[~valid_mask] = 0
-            boi = variances
-
-        best_idx = np.argmax(boi)
-
-        # Extract amplitude variation of best subcarrier
-        breath_raw = cal[:, best_idx]
-
-    elif method == "amplitude":
-        csi_cal = amplitude_calibration(csi_matrix)
-        # Simple amplitude-based: pick subcarrier with highest variance
-        boi = compute_boi_scores(csi_cal, fs, freq_lo=BOI_FREQ_LO, freq_hi=BOI_FREQ_HI)
-        boi[~valid_mask] = 0
-
-        amplitudes = np.abs(csi_cal)
+        amplitudes = np.abs(csi_matrix)
         best_idx = np.argmax(boi)
         breath_raw = amplitudes[:, best_idx] - np.mean(amplitudes[:, best_idx])
 
@@ -1004,7 +871,7 @@ def plot_comprehensive_analysis(
     """Generate comprehensive visualization of CSI breathing analysis."""
 
     if methods is None:
-        methods = ["complexbeat", "amplitude", "phase"]
+        methods = ["amplitude", "phase"]
 
     csi_raw = dataset.csi_matrix()
     T_raw, M = csi_raw.shape
@@ -1095,66 +962,36 @@ def plot_comprehensive_analysis(
     # =====================================================================
     # Figure 2: CIR Analysis
     # =====================================================================
-    fig2, axes2 = plt.subplots(2, 2, figsize=(14, 10))
+    fig2, axes2 = plt.subplots(1, 2, figsize=(14, 5))
     fig2.suptitle("Channel Impulse Response Analysis", fontsize=14, fontweight="bold")
 
     cir_matrix = compute_cir_matrix(csi_ordered)
     cir_amp = np.abs(cir_matrix)
 
-    im3 = axes2[0, 0].imshow(
+    im3 = axes2[0].imshow(
         cir_amp.T,
         aspect="auto",
         origin="lower",
         extent=[ts[0], ts[-1], 0, M],
         cmap="magma",
     )
-    axes2[0, 0].set_xlabel("Time (s)")
-    axes2[0, 0].set_ylabel("Delay tap")
-    axes2[0, 0].set_title("CIR Amplitude")
-    fig2.colorbar(im3, ax=axes2[0, 0], label="Amplitude")
+    axes2[0].set_xlabel("Time (s)")
+    axes2[0].set_ylabel("Delay tap")
+    axes2[0].set_title("CIR Amplitude")
+    fig2.colorbar(im3, ax=axes2[0], label="Amplitude")
 
     mean_cir = np.mean(cir_amp, axis=0)
-    axes2[0, 1].stem(
+    axes2[1].stem(
         range(min(32, M)),
         mean_cir[: min(32, M)],
         linefmt="-",
         markerfmt="o",
         basefmt="k-",
     )
-    axes2[0, 1].set_xlabel("Delay tap")
-    axes2[0, 1].set_ylabel("Mean amplitude")
-    axes2[0, 1].set_title("Power Delay Profile (mean)")
-    axes2[0, 1].grid(True, alpha=0.3)
-
-    csi_cal = amplitude_calibration(csi_ordered)
-    csi_cal = phase_calibration_linear(csi_cal)
-    csi_df = delay_filter(csi_cal)
-    cir_filt = compute_cir_matrix(csi_df)
-    cir_filt_amp = np.abs(cir_filt)
-
-    im4 = axes2[1, 0].imshow(
-        cir_filt_amp.T,
-        aspect="auto",
-        origin="lower",
-        extent=[ts[0], ts[-1], 0, M],
-        cmap="magma",
-    )
-    axes2[1, 0].set_xlabel("Time (s)")
-    axes2[1, 0].set_ylabel("Delay tap")
-    axes2[1, 0].set_title("CIR After Calibration + Delay Filter")
-    fig2.colorbar(im4, ax=axes2[1, 0], label="Amplitude")
-
-    raw_amp_mean = np.mean(np.abs(csi_ordered), axis=0)
-    cal_amp_mean = np.mean(np.abs(csi_df), axis=0)
-    axes2[1, 1].plot(range(M), raw_amp_mean, label="Raw", alpha=0.7, color="#F44336")
-    axes2[1, 1].plot(
-        range(M), cal_amp_mean, label="Calibrated", alpha=0.7, color="#4CAF50"
-    )
-    axes2[1, 1].set_xlabel("Subcarrier index")
-    axes2[1, 1].set_ylabel("Mean amplitude")
-    axes2[1, 1].set_title("Calibration Effect")
-    axes2[1, 1].legend()
-    axes2[1, 1].grid(True, alpha=0.3)
+    axes2[1].set_xlabel("Delay tap")
+    axes2[1].set_ylabel("Mean amplitude")
+    axes2[1].set_title("Power Delay Profile (mean)")
+    axes2[1].grid(True, alpha=0.3)
 
     fig2.tight_layout()
     fig2.savefig(
@@ -1165,13 +1002,14 @@ def plot_comprehensive_analysis(
     # =====================================================================
     # Figure 3: Subcarrier Selection (BoI Scores)
     # =====================================================================
-    fig3, axes3 = plt.subplots(1, 3, figsize=(16, 5))
+    fig3, axes3 = plt.subplots(1, len(methods), figsize=(8 * len(methods), 5))
+    if len(methods) == 1:
+        axes3 = [axes3]
     fig3.suptitle(
         "Band-of-Interest Subcarrier Selection", fontsize=14, fontweight="bold"
     )
 
     method_colors = {
-        "complexbeat": "#2196F3",
         "amplitude": "#FF9800",
         "phase": "#9C27B0",
     }
@@ -1185,7 +1023,7 @@ def plot_comprehensive_analysis(
             bars[best_idx].set_color(method_colors.get(method, "#2196F3"))
             bars[best_idx].set_alpha(1.0)
         axes3[i].set_xlabel("Subcarrier index")
-        axes3[i].set_ylabel("BoI score" if method == "complexbeat" else "Variance")
+        axes3[i].set_ylabel("BoI score" if method == "amplitude" else "Variance")
         axes3[i].set_title(f"{method.capitalize()} — best: SC {best_idx}")
         axes3[i].grid(True, alpha=0.3, axis="y")
 
@@ -1339,7 +1177,9 @@ def plot_comprehensive_analysis(
     # =====================================================================
     # Figure 6: Complex Plane / Constellation
     # =====================================================================
-    fig6, axes6 = plt.subplots(1, 3, figsize=(16, 5))
+    fig6, axes6 = plt.subplots(1, len(methods), figsize=(8 * len(methods), 5))
+    if len(methods) == 1:
+        axes6 = [axes6]
     fig6.suptitle(
         "CSI Complex Plane (Selected Subcarriers)", fontsize=14, fontweight="bold"
     )
@@ -1389,7 +1229,7 @@ def plot_comprehensive_analysis(
     )
 
     _, _, boi_all = extract_breathing_signal(
-        csi_ordered, fs, method="complexbeat", valid_mask=valid_mask
+        csi_ordered, fs, method="amplitude", valid_mask=valid_mask
     )
     boi_masked = boi_all.copy()
     boi_masked[~valid_mask] = 0
@@ -1507,17 +1347,14 @@ def main():
 Examples:
     python csi_breathing.py CSI_DATA.txt
     python csi_breathing.py CSI_DATA.txt --output-dir results
-    python csi_breathing.py CSI_DATA.txt --methods complexbeat amplitude
+    python csi_breathing.py CSI_DATA.txt --methods amplitude phase
 
 Methods:
-    complexbeat  - CIR-domain with amplitude/phase calibration (ComplexBeat)
-    amplitude    - Simple amplitude variance subcarrier selection
-    phase        - Phase-based with linear detrending (PhaseBeat-inspired)
+    amplitude    - Band-of-Interest subcarrier selection on amplitude
+    phase        - Phase-based with linear detrending
 
 References:
-    [1] Li et al., "ComplexBeat: Breathing Rate Estimation from Complex CSI",
-        IEEE SiPS 2021, arXiv:2502.12657
-    [2] Espressif ESP-CSI: https://github.com/espressif/esp-csi
+    [1] Espressif ESP-CSI: https://github.com/espressif/esp-csi
         """,
     )
     parser.add_argument("input", help="Path to CSI data file")
@@ -1531,8 +1368,8 @@ References:
         "--methods",
         "-m",
         nargs="+",
-        default=["complexbeat", "amplitude", "phase"],
-        choices=["complexbeat", "amplitude", "phase"],
+        default=["amplitude", "phase"],
+        choices=["amplitude", "phase"],
         help="Analysis methods to run",
     )
 
