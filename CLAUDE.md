@@ -89,9 +89,10 @@ Single-connection TCP server. On each new connection it:
 
 ### Analysis (`csi_breathing.py`)
 
-Implements two approaches:
-- **ComplexBeat** (Li et al., IEEE SiPS 2021): CIR-domain processing with amplitude/phase calibration and Band-of-Interest (BoI) subcarrier selection.
-- **PhaseBeat baseline**: phase-difference approach with DWT (PyWavelets) filtering.
+Implements three approaches (default: ratio):
+- **Ratio**: cross-subcarrier conjugate product `H[t,m] * conj(H[t,ref])` against the highest-SNR subcarrier; cancels common-mode hardware phase noise; BoI picks the best pair.
+- **Amplitude**: Band-of-Interest (BoI) subcarrier selection based on amplitude variance.
+- **Phase**: phase-difference approach with linear detrending.
 
 Key constants at the top of the file control the breathing frequency band (default 0.1–0.5 Hz / 6–30 BPM), BoI selection, pilot/null subcarrier masking, and Hampel filter parameters for DC removal.
 
