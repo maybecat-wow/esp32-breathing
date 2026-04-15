@@ -70,7 +70,7 @@ BOI_FREQ_LO = 0.15
 BOI_FREQ_HI = 0.5
 
 # Delay filter: max delay spread (in taps)
-DELAY_FILTER_MAX_TAPS = 8  # ~50 ns at 20 MHz BW
+DELAY_FILTER_MAX_TAPS = 1  # ~50 ns at 20 MHz BW
 
 # Hampel filter parameters (for DC removal in phase)
 HAMPEL_WINDOW = 5  # seconds
@@ -733,8 +733,7 @@ def extract_breathing_signal(
         best_idx = np.argmax(boi)
 
         # Extract amplitude variation of best subcarrier
-        breath_raw = np.abs(cal[:, best_idx])
-        breath_raw = breath_raw - np.mean(breath_raw)
+        breath_raw = cal[:, best_idx]
 
     elif method == "amplitude":
         csi_cal = amplitude_calibration(csi_matrix)
