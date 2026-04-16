@@ -58,21 +58,13 @@ INVALID_SUBCARRIERS = 2
 NUM_SUBCARRIERS = 64
 PILOT_INDICES_LLTF = {-21, -7, 7, 21}  # relative to center
 
-# Null subcarrier indices in the 64-element array (after reordering)
-# Index 0 = DC, indices 27..37 = guard band
-NULL_SUBCARRIER_RANGE = set(range(27, 38)) | {0}
-
-# Breathing frequency band (Hz) — 12 to 30 BPM
-BREATH_FREQ_LO = 0.1  # ~6 BPM lower bound for robustness
+# Breathing frequency band (Hz) — 6 to 30 BPM
+BREATH_FREQ_LO = 0.1  # 6 BPM lower bound
 BREATH_FREQ_HI = 0.5  # 30 BPM upper bound
 
 # BoI score computation band
 BOI_FREQ_LO = 0.15
 BOI_FREQ_HI = 0.5
-
-# Hampel filter parameters (for DC removal in phase)
-HAMPEL_WINDOW = 5  # seconds
-HAMPEL_THRESHOLD = 3.0  # MAD multiplier
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +109,7 @@ class CSIDataset:
     """Collection of parsed CSI frames."""
 
     frames: list = field(default_factory=list)
+    skipped_rows: int = 0
 
     @property
     def num_frames(self) -> int:
@@ -361,6 +354,7 @@ def _parse_csv(filepath: str) -> CSIDataset:
                 )
                 dataset.frames.append(frame)
             except (ValueError, IndexError):
+                dataset.skipped_rows += 1
                 continue
 
     return dataset
@@ -592,9 +586,14 @@ def cross_subcarrier_ratio(
     For each valid subcarrier m:
         R[t, m] = H[t, m] * conj(H[t, ref])
 
-    The product cancels common-mode hardware phase noise (CFO, SFO, random
-    per-packet phase offset) that is identical across all subcarriers, leaving
-    only the differential channel variation caused by motion/breathing.
+    The product cancels common-mode hardware phase noise components that are
+    constant across subcarriers (CFO, random per-packet phase offset), leaving
+    primarily the differential channel variation caused by motion/breathing.
+
+    Limitation: SFO and phase-based distortion (PBD) introduce a slope across
+    subcarrier indices that does NOT cancel intra-antenna. Full cancellation of
+    the slope term requires two physical antennas (inter-antenna ratio). With a
+    single-antenna ESP32, a residual term (ξ_d + ξ_s)(m - m_ref) remains.
 
     The reference subcarrier is the valid subcarrier with the highest mean
     amplitude (best SNR).
@@ -672,10 +671,10 @@ def extract_breathing_signal(
 
         variances = np.var(phase_detrended, axis=0)
         variances[~valid_mask] = 0
-        boi = variances
 
         best_idx = np.argmax(variances)
         breath_raw = phase_detrended[:, best_idx]
+        boi = variances
 
     else:
         raise ValueError(f"Unknown method: {method}")
@@ -703,8 +702,8 @@ def bandpass_filter(
     try:
         b, a = sig.butter(order, [lo / nyq, hi / nyq], btype="band")
         return sig.filtfilt(b, a, x, padlen=min(3 * max(len(b), len(a)), len(x) - 1))
-    except ValueError:
-        # Fallback: FFT-based filtering for very short signals
+    except ValueError as e:
+        print(f"[WARN] Butterworth filter failed ({e}); falling back to FFT bandpass")
         return fft_bandpass(x, fs, lo, hi)
 
 
@@ -741,36 +740,11 @@ def dwt_filter(
     # Decompose
     coeffs = pywt.wavedec(x, wavelet, level=level)
 
-    # Zero out detail coefficients above the desired frequency
-    # Keep only approximation + lowest detail levels
-    for i in range(1, min(2, len(coeffs))):
-        pass  # keep these
-    for i in range(2, len(coeffs)):
+    # Zero out all detail coefficients; keep only the approximation (coeffs[0])
+    for i in range(1, len(coeffs)):
         coeffs[i] = np.zeros_like(coeffs[i])
 
     return pywt.waverec(coeffs, wavelet)[: len(x)]
-
-
-def hampel_filter(
-    x: np.ndarray, window_size: int = 5, threshold: float = HAMPEL_THRESHOLD
-) -> np.ndarray:
-    """Hampel filter for outlier removal (used for DC removal in PhaseBeat)."""
-    n = len(x)
-    y = x.copy()
-    half_w = window_size // 2
-
-    for i in range(n):
-        lo = max(0, i - half_w)
-        hi = min(n, i + half_w + 1)
-        window = x[lo:hi]
-        median_val = np.median(window)
-        mad = np.median(np.abs(window - median_val))
-        mad_scaled = 1.4826 * mad  # scale to match std dev for normal dist
-
-        if mad_scaled > 0 and np.abs(x[i] - median_val) > threshold * mad_scaled:
-            y[i] = median_val
-
-    return y
 
 
 # ---------------------------------------------------------------------------
@@ -787,7 +761,8 @@ def estimate_breathing_rate_psd(
 ) -> tuple:
     """Estimate breathing rate from PSD peak detection.
 
-    Returns: (rate_bpm, frequency, psd_freqs, psd_values)
+    Returns: (rate_bpm, frequency, psd_freqs, psd_values, reason)
+    reason is an empty string on success, or a short failure description.
     """
     N = len(x)
     # Zero-pad for frequency resolution
@@ -805,7 +780,7 @@ def estimate_breathing_rate_psd(
     breath_mask = (freqs_pos >= freq_lo) & (freqs_pos <= freq_hi)
 
     if not np.any(breath_mask):
-        return 0.0, 0.0, freqs_pos, psd
+        return 0.0, 0.0, freqs_pos, psd, "no energy in breathing band"
 
     psd_breath = psd.copy()
     psd_breath[~breath_mask] = 0
@@ -814,7 +789,7 @@ def estimate_breathing_rate_psd(
     peak_freq = freqs_pos[peak_idx]
     rate_bpm = peak_freq * 60.0
 
-    return rate_bpm, peak_freq, freqs_pos, psd
+    return rate_bpm, peak_freq, freqs_pos, psd, ""
 
 
 def estimate_breathing_rate_autocorr(
@@ -825,7 +800,8 @@ def estimate_breathing_rate_autocorr(
 ) -> tuple:
     """Estimate breathing rate from autocorrelation peak.
 
-    Returns: (rate_bpm, peak_lag_seconds, lags, autocorr)
+    Returns: (rate_bpm, peak_lag_seconds, lags, autocorr, reason)
+    reason is an empty string on success, or a short failure description.
     """
     N = len(x)
     x_norm = x - np.mean(x)
@@ -844,11 +820,11 @@ def estimate_breathing_rate_autocorr(
     max_lag = min(max_lag, len(acf) - 1)
 
     if min_lag >= max_lag or min_lag >= len(acf):
-        return 0.0, 0.0, lags_seconds, acf
+        return 0.0, 0.0, lags_seconds, acf, "search range empty"
 
     acf_search = acf[min_lag : max_lag + 1]
     if len(acf_search) == 0:
-        return 0.0, 0.0, lags_seconds, acf
+        return 0.0, 0.0, lags_seconds, acf, "search range empty"
 
     peak_local = np.argmax(acf_search)
     peak_lag = min_lag + peak_local
@@ -858,8 +834,9 @@ def estimate_breathing_rate_autocorr(
         rate_bpm = 60.0 / peak_period
     else:
         rate_bpm = 0.0
+        return rate_bpm, peak_period, lags_seconds, acf, "zero-lag peak"
 
-    return rate_bpm, peak_period, lags_seconds, acf
+    return rate_bpm, peak_period, lags_seconds, acf, ""
 
 
 def estimate_breathing_rate_peaks(
@@ -870,7 +847,8 @@ def estimate_breathing_rate_peaks(
 ) -> tuple:
     """Estimate breathing rate from time-domain peak counting.
 
-    Returns: (rate_bpm, peak_times, peak_indices)
+    Returns: (rate_bpm, peak_times, peak_indices, reason)
+    reason is an empty string on success, or a short failure description.
     """
     min_distance = int(fs / freq_hi) if freq_hi > 0 else 1
     min_distance = max(1, min_distance)
@@ -878,21 +856,22 @@ def estimate_breathing_rate_peaks(
     peaks, properties = sig.find_peaks(x, distance=min_distance, prominence=0)
 
     if len(peaks) < 2:
-        return 0.0, np.array([]) / fs if len(peaks) > 0 else np.array([]), peaks
+        return 0.0, np.array([]) / fs if len(peaks) > 0 else np.array([]), peaks, f"<2 peaks ({len(peaks)} found)"
 
     peak_times = peaks / fs
     intervals = np.diff(peak_times)
 
     if len(intervals) == 0:
-        return 0.0, peak_times, peaks
+        return 0.0, peak_times, peaks, "<2 peaks"
 
     mean_interval = np.mean(intervals)
     if mean_interval > 0:
         rate_bpm = 60.0 / mean_interval
     else:
         rate_bpm = 0.0
+        return rate_bpm, peak_times, peaks, "zero mean interval"
 
-    return rate_bpm, peak_times, peaks
+    return rate_bpm, peak_times, peaks, ""
 
 
 # ---------------------------------------------------------------------------
@@ -971,7 +950,7 @@ def plot_comprehensive_analysis(
     axes1[0, 0].set_xlabel("Time (s)")
     axes1[0, 0].set_ylabel("Subcarrier index")
     axes1[0, 0].set_title("CSI Amplitude")
-    fig1.colorbar(im, ax=axes1[0, 0], label="Amplitude")
+    fig1.colorbar(im, ax=axes1[0, 0], label="Amplitude (arb.)")
 
     phase_matrix = np.angle(csi_ordered)
     im2 = axes1[0, 1].imshow(
@@ -996,7 +975,7 @@ def plot_comprehensive_analysis(
     colors = ["#4CAF50" if valid_mask[i] else "#F44336" for i in range(M)]
     axes1[1, 1].bar(range(M), mean_amp, color=colors, width=1.0, alpha=0.7)
     axes1[1, 1].set_xlabel("Subcarrier index (freq-ordered)")
-    axes1[1, 1].set_ylabel("Mean amplitude")
+    axes1[1, 1].set_ylabel("Mean amplitude (arb.)")
     axes1[1, 1].set_title("Subcarrier Amplitudes (green=valid, red=null/pilot)")
     axes1[1, 1].grid(True, alpha=0.3, axis="y")
 
@@ -1025,7 +1004,7 @@ def plot_comprehensive_analysis(
     axes2[0].set_xlabel("Time (s)")
     axes2[0].set_ylabel("Delay tap")
     axes2[0].set_title("CIR Amplitude")
-    fig2.colorbar(im3, ax=axes2[0], label="Amplitude")
+    fig2.colorbar(im3, ax=axes2[0], label="Amplitude (arb.)")
 
     mean_cir = np.mean(cir_amp, axis=0)
     axes2[1].stem(
@@ -1036,7 +1015,7 @@ def plot_comprehensive_analysis(
         basefmt="k-",
     )
     axes2[1].set_xlabel("Delay tap")
-    axes2[1].set_ylabel("Mean amplitude")
+    axes2[1].set_ylabel("Mean amplitude (arb.)")
     axes2[1].set_title("Power Delay Profile (mean)")
     axes2[1].grid(True, alpha=0.3)
 
@@ -1053,7 +1032,9 @@ def plot_comprehensive_analysis(
     if len(methods) == 1:
         axes3 = [axes3]
     fig3.suptitle(
-        "Band-of-Interest Subcarrier Selection", fontsize=14, fontweight="bold"
+        "Subcarrier Selection (BoI score for ratio/amplitude; variance for phase)",
+        fontsize=14,
+        fontweight="bold",
     )
 
     method_colors = {
@@ -1103,7 +1084,8 @@ def plot_comprehensive_analysis(
                 breath_filtered = bandpass_filter(
                     breath_raw, fs, BREATH_FREQ_LO, BREATH_FREQ_HI
                 )
-            except Exception:
+            except Exception as e:
+                print(f"[WARN] Bandpass filter failed for {method} ({e}); falling back to FFT bandpass")
                 breath_filtered = fft_bandpass(
                     breath_raw, fs, BREATH_FREQ_LO, BREATH_FREQ_HI
                 )
@@ -1122,7 +1104,7 @@ def plot_comprehensive_analysis(
         )
         axes4[i].plot(ts, breath_filtered, color=color, linewidth=1.8, label="Filtered")
         axes4[i].set_xlabel("Time (s)")
-        axes4[i].set_ylabel("Amplitude")
+        axes4[i].set_ylabel("Amplitude (arb.)")
         axes4[i].set_title(f"{method.capitalize()} — Subcarrier {best_idx}")
         axes4[i].legend(loc="upper right")
         axes4[i].grid(True, alpha=0.3)
@@ -1145,15 +1127,15 @@ def plot_comprehensive_analysis(
 
     print(f"\n  Breathing Rate Estimates:")
     print(
-        f"  {'Method':<15} {'PSD (BPM)':<15} {'Autocorr (BPM)':<15} {'Peaks (BPM)':<15}"
+        f"  {'Method':<15} {'PSD (BPM)':<25} {'Autocorr (BPM)':<25} {'Peaks (BPM)':<25}"
     )
-    print(f"  {'-'*58}")
+    print(f"  {'-'*88}")
 
     for i, method in enumerate(methods):
         x = results[method]["filtered"]
         color = method_colors.get(method, "#2196F3")
 
-        rate_psd, peak_freq, freqs_psd, psd_vals = estimate_breathing_rate_psd(x, fs)
+        rate_psd, peak_freq, freqs_psd, psd_vals, reason_psd = estimate_breathing_rate_psd(x, fs)
 
         breath_band = (freqs_psd >= BREATH_FREQ_LO) & (freqs_psd <= BREATH_FREQ_HI)
         axes5[i, 0].semilogy(
@@ -1176,13 +1158,13 @@ def plot_comprehensive_analysis(
                 label=f"Peak: {rate_psd:.1f} BPM ({peak_freq:.3f} Hz)",
             )
         axes5[i, 0].set_xlabel("Frequency (Hz)")
-        axes5[i, 0].set_ylabel("PSD")
+        axes5[i, 0].set_ylabel("Normalized PSD")
         axes5[i, 0].set_title(f"{method.capitalize()} — Power Spectral Density")
         axes5[i, 0].set_xlim(0, min(2.0, fs / 2))
         axes5[i, 0].legend(fontsize=8)
         axes5[i, 0].grid(True, alpha=0.3)
 
-        rate_ac, peak_period, lags, acf = estimate_breathing_rate_autocorr(x, fs)
+        rate_ac, peak_period, lags, acf, reason_ac = estimate_breathing_rate_autocorr(x, fs)
         max_lag_plot = min(len(lags), int(fs * 15))
         axes5[i, 1].plot(
             lags[:max_lag_plot], acf[:max_lag_plot], color=color, linewidth=1.2
@@ -1209,12 +1191,12 @@ def plot_comprehensive_analysis(
         axes5[i, 1].legend(fontsize=8)
         axes5[i, 1].grid(True, alpha=0.3)
 
-        rate_pk, peak_times_m, peak_idx_m = estimate_breathing_rate_peaks(x, fs)
+        rate_pk, peak_times_m, peak_idx_m, reason_pk = estimate_breathing_rate_peaks(x, fs)
 
-        psd_str = f"{rate_psd:.1f}" if rate_psd > 0 else "N/A"
-        ac_str = f"{rate_ac:.1f}" if rate_ac > 0 else "N/A"
-        pk_str = f"{rate_pk:.1f}" if rate_pk > 0 else "N/A"
-        print(f"  {method:<15} {psd_str:<15} {ac_str:<15} {pk_str:<15}")
+        psd_str = f"{rate_psd:.1f}" if rate_psd > 0 else f"N/A ({reason_psd})"
+        ac_str = f"{rate_ac:.1f}" if rate_ac > 0 else f"N/A ({reason_ac})"
+        pk_str = f"{rate_pk:.1f}" if rate_pk > 0 else f"N/A ({reason_pk})"
+        print(f"  {method:<15} {psd_str:<25} {ac_str:<25} {pk_str:<25}")
 
     fig5.tight_layout()
     fig5.savefig(
@@ -1303,7 +1285,7 @@ def plot_comprehensive_analysis(
         )
 
     axes7[0].set_xlabel("Time (s)")
-    axes7[0].set_ylabel("Amplitude (DC removed)")
+    axes7[0].set_ylabel("Amplitude, DC removed (arb.)")
     axes7[0].set_title("Top-5 Subcarrier Amplitude Variation")
     axes7[0].legend(fontsize=8, ncol=5, loc="upper right")
     axes7[0].grid(True, alpha=0.3)
@@ -1330,7 +1312,7 @@ def plot_comprehensive_analysis(
             results.keys(), key=lambda m: np.max(np.abs(results[m]["filtered"]))
         )
         x_best = results[best_method]["filtered"]
-        rate_best, peak_times_best, peak_idx_best = estimate_breathing_rate_peaks(
+        rate_best, peak_times_best, peak_idx_best, _ = estimate_breathing_rate_peaks(
             x_best, fs
         )
 
@@ -1351,10 +1333,10 @@ def plot_comprehensive_analysis(
                 label=f"Peaks ({len(peak_idx_best)} detected)",
             )
         ax8.set_xlabel("Time (s)")
-        ax8.set_ylabel("Amplitude")
+        ax8.set_ylabel("Amplitude (arb.)")
         rate_str = f"{rate_best:.1f} BPM" if rate_best > 0 else "N/A"
         ax8.set_title(
-            f"Breathing Waveform — {best_method.capitalize()} — Est. Rate: {rate_str}"
+            f"Breathing Waveform — {best_method.capitalize()} (strongest signal) — Est. Rate: {rate_str}"
         )
         ax8.legend(loc="upper right")
         ax8.grid(True, alpha=0.3)
@@ -1436,7 +1418,8 @@ References:
         print("Error: No valid CSI frames found in file.")
         sys.exit(1)
 
-    print(f"  Parsed {dataset.num_frames} CSI frames")
+    skipped_info = f" ({dataset.skipped_rows} malformed rows skipped)" if dataset.skipped_rows > 0 else ""
+    print(f"  Parsed {dataset.num_frames} CSI frames{skipped_info}")
 
     plot_comprehensive_analysis(dataset, args.output_dir, methods=args.methods)
 
