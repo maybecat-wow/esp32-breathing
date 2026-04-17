@@ -78,30 +78,30 @@ class CSIFrame:
 
     line_number: int
     timestamp_str: str  # serial monitor timestamp e.g. "20:04:16.919"
-    seq: int
-    mac: str
-    rssi: int
-    rate: int
-    sig_mode: int
-    mcs: int
-    bandwidth: int
-    smoothing: int
-    not_sounding: int
-    aggregation: int
-    stbc: int
-    fec_coding: int
-    sgi: int
-    noise_floor: int
-    ampdu_cnt: int
-    channel: int
-    secondary_channel: int
-    local_timestamp: int  # ESP32 microsecond timer
-    ant: int
-    sig_len: int
-    rx_state: int
-    csi_len: int
-    first_word: int
-    raw_csi: np.ndarray  # complex64 array of subcarrier values
+    seq: int           # frame sequence number (wraps at 65535)
+    mac: str           # source MAC address of the transmitting device
+    rssi: int          # received signal strength (dBm); used for SNR context
+    rate: int          # PHY data rate index
+    sig_mode: int      # 0=non-HT (legacy), 1=HT, 3=VHT
+    mcs: int           # modulation and coding scheme index
+    bandwidth: int     # channel bandwidth in MHz (0=20, 1=40)
+    smoothing: int     # whether channel smoothing was applied by hardware
+    not_sounding: int  # 0=sounding frame (beamforming probe), 1=normal
+    aggregation: int   # MPDU aggregation flag
+    stbc: int          # space-time block coding flag
+    fec_coding: int    # 0=BCC, 1=LDPC
+    sgi: int           # short guard interval (400ns vs 800ns)
+    noise_floor: int   # estimated noise floor (dBm)
+    ampdu_cnt: int     # A-MPDU sub-frame count
+    channel: int       # primary Wi-Fi channel (1–14)
+    secondary_channel: int  # secondary channel offset for 40 MHz (0/1/2)
+    local_timestamp: int  # ESP32 microsecond timer (esp_timer_get_time)
+    ant: int           # receive antenna index
+    sig_len: int        # MPDU length in bytes
+    rx_state: int       # hardware receive state (0=normal)
+    csi_len: int        # raw CSI byte count (= 2 × num_subcarriers)
+    first_word: int     # first-word validity flag; non-zero means first 2 subcarriers are corrupt
+    raw_csi: np.ndarray  # complex64 array of subcarrier values, length = csi_len / 2
 
 
 @dataclass
@@ -109,7 +109,7 @@ class CSIDataset:
     """Collection of parsed CSI frames."""
 
     frames: list = field(default_factory=list)
-    skipped_rows: int = 0
+    skipped_rows: int = 0  # lines that failed to parse (malformed/incomplete)
 
     @property
     def num_frames(self) -> int:
@@ -124,6 +124,7 @@ class CSIDataset:
     def timestamps_s(self) -> np.ndarray:
         """Timestamps in seconds (relative to first frame)."""
         ts = self.timestamps_us
+        # Subtract first timestamp so t=0 at recording start
         return (ts - ts[0]) / 1e6
 
     @property
@@ -136,10 +137,12 @@ class CSIDataset:
         dt = dt[dt > 0]
         if len(dt) == 0:
             return 100.0
+        # Median is robust to burst gaps and duplicated timestamps
         return 1.0 / np.median(dt)
 
     @property
     def rssi(self) -> np.ndarray:
+        # Shape (T,) — useful for flagging low-quality frames
         return np.array([f.rssi for f in self.frames])
 
     def csi_matrix(self) -> np.ndarray:
@@ -148,6 +151,7 @@ class CSIDataset:
 
     @property
     def duration_s(self) -> float:
+        # Total recording span in seconds; used to assess signal length for PSD
         ts = self.timestamps_s
         return ts[-1] - ts[0] if len(ts) > 1 else 0.0
 
@@ -206,8 +210,12 @@ def parse_csi_values(csi_str: str) -> np.ndarray:
     num_complex = len(values) // 2
     csi = np.zeros(num_complex, dtype=np.complex64)
     for i in range(num_complex):
-        imag = values[2 * i]
-        real = values[2 * i + 1]
+        # ESP32 stores each complex sample as two consecutive int8 bytes in
+        # (imaginary, real) order — the opposite of the usual (real, imag) convention.
+        # Byte layout: [..., imag_k, real_k, imag_{k+1}, real_{k+1}, ...]
+        # So index 2*i is imaginary and 2*i+1 is real for subcarrier i.
+        imag = values[2 * i]      # even offset → imaginary component
+        real = values[2 * i + 1]  # odd offset  → real component
         csi[i] = complex(real, imag)
 
     return csi
@@ -215,6 +223,12 @@ def parse_csi_values(csi_str: str) -> np.ndarray:
 
 def _detect_format(filepath: str) -> str:
     """Detect whether file is CSV-with-header or serial-monitor format."""
+    # Two distinct formats exist in the wild:
+    #   Serial: lines like "HH:MM:SS.mmm -> CSI_DATA,field1,...,[imag,real,...]"
+    #           produced by the Arduino/IDF serial monitor.
+    #   CSV: lines like "CSI_DATA,field1,...,\"[imag,real,...]\""
+    #        produced by esp-csi's logger or exported tools.
+    # We sniff the first line to decide which parser to invoke.
     with open(filepath, "r", encoding="utf-8", errors="replace") as f:
         first_line = f.readline().strip()
     if first_line.startswith("type,") or first_line.startswith("type\t"):
@@ -456,14 +470,20 @@ def reorder_subcarriers(csi_matrix: np.ndarray) -> np.ndarray:
         return csi_matrix  # only reorder for standard 64-subcarrier LLTF
 
     reordered = np.zeros_like(csi_matrix)
-    # FFT shift: move indices 32..63 to positions 0..31 (negative freq)
-    #            move indices 0..31 to positions 32..63 (positive freq)
-    reordered[:, :32] = csi_matrix[:, 32:]  # negative freq subcarriers
-    reordered[:, 32:] = csi_matrix[:, :32]  # positive freq subcarriers
+    # FFT-shift rationale: the ESP32 firmware reports positive-frequency subcarriers
+    # first (indices 0..31) followed by negative-frequency subcarriers (indices 32..63).
+    # Standard signal-processing convention places negative frequencies before positive
+    # (cf. np.fft.fftshift), so we swap the two halves to obtain the intuitive layout:
+    # index 0 → subcarrier –32 (most negative), index 32 → DC, index 63 → subcarrier +31.
+    reordered[:, :32] = csi_matrix[:, 32:]  # negative freq subcarriers → left half
+    reordered[:, 32:] = csi_matrix[:, :32]  # positive freq subcarriers → right half
 
-    # Invalidate first 2 subcarriers (ESP32 first_word_invalid)
-    reordered[:, 32] = 0  # was index 0 in storage
-    reordered[:, 33] = 0  # was index 1 in storage
+    # After the shift, storage indices 0 and 1 (positive side) end up at reordered
+    # indices 32 and 33.  The ESP32 hardware marks these two subcarriers as invalid
+    # via the first_word field; zero them unconditionally to prevent them from
+    # contaminating subcarrier selection or BoI scoring.
+    reordered[:, 32] = 0  # was storage index 0 — hardware-invalid first word
+    reordered[:, 33] = 0  # was storage index 1 — hardware-invalid first word
 
     return reordered
 
@@ -481,14 +501,21 @@ def get_valid_subcarrier_mask(n_sub: int = 64) -> np.ndarray:
     # After reorder, that's indices 6..31 (neg side) and 33..58 (pos side)
     # But first 2 storage positions are invalid → indices 32, 33 already zeroed
 
-    # Null/guard: indices 0..5 and 59..63
-    mask[:6] = False
-    mask[59:] = False
-    # DC and invalid first_word
-    mask[32] = False
-    mask[33] = False
+    # Guard bands (LLTF 20 MHz): subcarriers ±27..±32 are guard/null tones that
+    # carry no data and have near-zero energy; exclude to avoid polluting BoI.
+    mask[:6] = False   # indices 0..5  → subcarriers −32..−27 (guard band)
+    mask[59:] = False  # indices 59..63 → subcarriers +27..+31 (guard band)
+
+    # DC subcarrier (index 32) is always zero in OFDM; the two adjacent indices
+    # (32, 33) are also zeroed because they correspond to the hardware-invalid
+    # first_word subcarriers (see reorder_subcarriers).
+    mask[32] = False   # DC subcarrier — no channel information
+    mask[33] = False   # hardware-invalid (first_word artifact)
 
     # Pilot subcarriers (after reorder, center at 32):
+    # LLTF pilots at relative offsets ±7 and ±21 carry known BPSK symbols used
+    # for phase tracking by the receiver; their amplitude variation is dominated
+    # by AGC/phase corrections rather than the channel, so exclude them.
     # subcarrier -21 → index 32-21=11, -7 → 25, +7 → 39, +21 → 53
     for p in [11, 25, 39, 53]:
         if 0 <= p < n_sub:
@@ -522,22 +549,29 @@ def compute_boi_scores(
             scores[m] = 0
             continue
 
-        # Use both amplitude and phase variations
-        # Compute PSD of the complex signal magnitude
+        # Work on the mean-subtracted amplitude envelope;
+        # this separates breathing-driven fluctuations from the carrier level.
         amp_signal = np.abs(x) - np.mean(np.abs(x))
 
         if T < 8:
-            # Too few samples for reliable PSD — use simple FFT
+            # Too few samples for Welch — fall back to a zero-padded FFT.
+            # Zero-padding interpolates the DFT grid but does not add spectral
+            # resolution; it is only used here to get a usable frequency axis.
             X = np.fft.fft(amp_signal, n=max(256, T * 8))
             freqs = np.fft.fftfreq(len(X), d=1.0 / fs)
             psd = np.abs(X) ** 2
         else:
+            # Welch’s method splits the signal into overlapping segments and
+            # averages their periodograms, reducing spectral variance by ~nperseg/2
+            # compared to a single FFT — critical for short, noisy CSI records.
             nperseg = min(T, max(8, T // 2))
             freqs, psd = sig.welch(
                 amp_signal, fs=fs, nperseg=nperseg, noverlap=nperseg // 2
             )
 
-        # Band of interest power
+        # BoI score = in-band power / out-of-band power.
+        # A high ratio means the subcarrier’s amplitude variation is concentrated
+        # in the breathing band rather than in higher-frequency noise.
         breath_mask = (np.abs(freqs) >= freq_lo) & (np.abs(freqs) <= freq_hi)
         above_mask = np.abs(freqs) > freq_hi
 
@@ -561,6 +595,10 @@ def resample_uniform(
 
     Returns: (resampled_matrix, uniform_timestamps, actual_fs)
     """
+    # ESP32 timestamps are non-uniform: the Wi-Fi driver schedules pings at a
+    # nominal rate but FreeRTOS tick quantization (1 ms default) and driver
+    # jitter cause variable inter-frame spacing.  All spectral estimators (FFT,
+    # Welch, autocorrelation) require a uniform time axis, so we resample first.
     duration = timestamps_s[-1] - timestamps_s[0]
     n_samples = int(duration * target_fs) + 1
     t_uniform = np.linspace(timestamps_s[0], timestamps_s[-1], n_samples)
@@ -570,6 +608,11 @@ def resample_uniform(
     resampled = np.zeros((n_samples, M), dtype=np.complex64)
 
     for m in range(M):
+        # Interpolate real and imaginary parts independently: numpy’s np.interp
+        # operates on real-valued arrays, and there is no standard definition of
+        # linear interpolation for complex numbers (the "straight line" between
+        # two phasors depends on whether you interpolate magnitude+phase or I+Q).
+        # Interpolating I and Q separately preserves linearity in Cartesian space.
         real_interp = np.interp(t_uniform, timestamps_s, np.real(csi_matrix[:, m]))
         imag_interp = np.interp(t_uniform, timestamps_s, np.imag(csi_matrix[:, m]))
         resampled[:, m] = real_interp + 1j * imag_interp
@@ -605,9 +648,20 @@ def cross_subcarrier_ratio(
     mean_amp = np.mean(np.abs(csi_matrix), axis=0)
     mean_amp_valid = mean_amp.copy()
     mean_amp_valid[~valid_mask] = 0
+    # Choose the valid subcarrier with the highest mean amplitude as the reference;
+    # highest amplitude → best SNR → least noise injected into every ratio.
     ref_idx = int(np.argmax(mean_amp_valid))
 
     ref = csi_matrix[:, ref_idx]          # (T,)
+    # H[t,m] * conj(H[t,ref]) eliminates the per-packet common phase rotation
+    # θ(t) that the ESP32 hardware applies identically across all subcarriers
+    # (due to CFO correction residual and random initial phase).  After the
+    # product only differential channel variation — caused by motion or breathing
+    # — and the SFO slope term remain.
+    # NOTE: with a single antenna the SFO/PBD slope (m - m_ref)*δ is NOT
+    # cancelled by this product; it introduces a frequency-dependent phase ramp
+    # that can bias the breathing estimate for subcarrier pairs far from the
+    # reference.  Inter-antenna ratios (two physical RX chains) would cancel it.
     ratio = csi_matrix * np.conj(ref[:, np.newaxis])  # (T, M)
     return ratio, ref_idx
 
@@ -635,8 +689,10 @@ def extract_breathing_signal(
         valid_mask = get_valid_subcarrier_mask(M)
 
     if method == "ratio":
-        # Cross-subcarrier ratio: cancel common-mode hardware phase noise,
-        # then pick the subcarrier pair with the strongest breathing signal.
+        # RATIO branch: form the cross-subcarrier conjugate product to remove the
+        # common per-packet phase rotation, then extract the differential phase of
+        # the best-scoring subcarrier pair.  Phase of the ratio is a robust proxy
+        # for the breathing-induced path-length change (modulo the SFO residual).
         ratio, ref_idx = cross_subcarrier_ratio(csi_matrix, valid_mask)
 
         boi = compute_boi_scores(ratio, fs, freq_lo=BOI_FREQ_LO, freq_hi=BOI_FREQ_HI)
@@ -650,7 +706,10 @@ def extract_breathing_signal(
         breath_raw = phase_ratio - np.mean(phase_ratio)
 
     elif method == "amplitude":
-        # Pick the subcarrier with the highest Band-of-Interest score
+        # AMPLITUDE branch: breathing moves the scatterer (chest), changing the
+        # multipath interference at each subcarrier and thus its amplitude.  We
+        # select the subcarrier whose amplitude PSD has the highest in-band
+        # (BoI) score, then use its mean-subtracted amplitude as the breathing signal.
         boi = compute_boi_scores(csi_matrix, fs, freq_lo=BOI_FREQ_LO, freq_hi=BOI_FREQ_HI)
         boi[~valid_mask] = 0
 
@@ -659,13 +718,19 @@ def extract_breathing_signal(
         breath_raw = amplitudes[:, best_idx] - np.mean(amplitudes[:, best_idx])
 
     elif method == "phase":
-        # Phase-difference based (PhaseBeat-inspired)
+        # PHASE branch: breathing causes a time-varying phase shift on each
+        # subcarrier proportional to the path-length change.  We unwrap the raw
+        # phase to remove 2π discontinuities, then remove the linear drift
+        # (SFO + static phase offset) with a first-order polynomial fit, and
+        # select the subcarrier with the highest residual phase variance.
         phases = np.angle(csi_matrix)
         # Use phase directly (single antenna — no inter-antenna difference available)
         # Remove linear trend per subcarrier
         phase_detrended = np.zeros_like(phases)
         for m in range(M):
             p = np.unwrap(phases[:, m])
+            # Fit and subtract a line (degree-1 polynomial) to remove the SFO
+            # frequency ramp and any constant hardware phase offset.
             p = p - np.polyval(np.polyfit(np.arange(T), p, 1), np.arange(T))
             phase_detrended[:, m] = p
 
@@ -701,6 +766,11 @@ def bandpass_filter(
 
     try:
         b, a = sig.butter(order, [lo / nyq, hi / nyq], btype="band")
+        # filtfilt applies the filter forward and backward, achieving zero-phase
+        # filtering with no group-delay distortion — essential for preserving the
+        # timing of breathing peaks used by the autocorrelation estimator.
+        # padlen = 3 × filter order is the scipy default and ensures the edge
+        # transients die out before the actual data; smaller values cause ringing.
         return sig.filtfilt(b, a, x, padlen=min(3 * max(len(b), len(a)), len(x) - 1))
     except ValueError as e:
         print(f"[WARN] Butterworth filter failed ({e}); falling back to FFT bandpass")
@@ -732,15 +802,20 @@ def dwt_filter(
     if max_level < 1:
         return x
 
-    # Find level corresponding to max_freq
-    # At level L, frequency band is approximately [0, fs/(2^(L+1))]
+    # Each DWT level halves the bandwidth of the approximation subband.
+    # At level L the approximation covers [0, fs / 2^(L+1)].  We solve for L
+    # such that fs / 2^(L+1) ≈ max_freq, i.e. L ≈ log2(fs / (2*max_freq)).
+    # This ensures we keep exactly the sub-band that contains the breathing signal.
     target_level = max(1, int(np.log2(fs / (2 * max_freq))))
     level = min(target_level, max_level)
 
     # Decompose
     coeffs = pywt.wavedec(x, wavelet, level=level)
 
-    # Zero out all detail coefficients; keep only the approximation (coeffs[0])
+    # Zero out all detail coefficients (high-frequency subbands) and keep only
+    # the level-L approximation (coeffs[0]).  The approximation represents the
+    # low-pass filtered signal; detail bands contain progressively higher
+    # frequencies that are above the breathing band and are discarded as noise.
     for i in range(1, len(coeffs)):
         coeffs[i] = np.zeros_like(coeffs[i])
 
@@ -765,13 +840,17 @@ def estimate_breathing_rate_psd(
     reason is an empty string on success, or a short failure description.
     """
     N = len(x)
-    # Zero-pad for frequency resolution
+    # Zero-padding to nfft > N interpolates the DFT grid, giving a finer
+    # frequency resolution in the output — useful for resolving the breathing
+    # peak when N is small.  It does NOT increase true spectral resolution
+    # (which is bounded by 1/duration), but it reduces picket-fence bias.
     nfft = max(1024, N * zero_pad_factor)
 
     X = np.fft.fft(x, n=nfft)
     freqs = np.fft.fftfreq(nfft, d=1.0 / fs)
 
-    # Take positive frequencies only
+    # Restrict to positive frequencies: the input x is real-valued so the
+    # spectrum is Hermitian-symmetric and the negative half is redundant.
     pos_mask = freqs > 0
     freqs_pos = freqs[pos_mask]
     psd = np.abs(X[pos_mask]) ** 2
@@ -808,13 +887,19 @@ def estimate_breathing_rate_autocorr(
 
     # Full autocorrelation
     acf = np.correlate(x_norm, x_norm, mode="full")
-    acf = acf[N - 1 :]  # keep positive lags
-    acf = acf / (acf[0] + 1e-12)  # normalize
+    acf = acf[N - 1 :]  # keep positive lags (lag 0 and above)
+    # Normalize by the zero-lag value (= signal power) so the ACF is in [-1, 1].
+    # The 1e-12 guard prevents division-by-zero for all-zero signals.
+    acf = acf / (acf[0] + 1e-12)
 
     lags_samples = np.arange(len(acf))
     lags_seconds = lags_samples / fs
 
-    # Search for first peak in breathing range
+    # Bound the search window to the physically plausible breath-period range.
+    # min_lag = fs / freq_hi corresponds to the shortest possible breath period
+    # (fastest breathing, freq_hi = 0.5 Hz → 2 s period).  max_lag = fs / freq_lo
+    # corresponds to the slowest (freq_lo = 0.1 Hz → 10 s period).  Searching
+    # outside this window picks up harmonics or DC-drift artifacts instead.
     min_lag = int(fs / freq_hi) if freq_hi > 0 else 1
     max_lag = int(fs / freq_lo) if freq_lo > 0 else len(acf)
     max_lag = min(max_lag, len(acf) - 1)
@@ -850,6 +935,10 @@ def estimate_breathing_rate_peaks(
     Returns: (rate_bpm, peak_times, peak_indices, reason)
     reason is an empty string on success, or a short failure description.
     """
+    # distance=int(fs/freq_hi) enforces a minimum separation between detected
+    # peaks equal to the shortest expected breath period (at freq_hi = 0.5 Hz,
+    # that is 2 s → fs*2 samples).  Without this constraint, noise spikes within
+    # a single breath cycle would be counted as separate breaths.
     min_distance = int(fs / freq_hi) if freq_hi > 0 else 1
     min_distance = max(1, min_distance)
 
@@ -881,6 +970,13 @@ def estimate_breathing_rate_peaks(
 
 def compute_cir_matrix(csi_matrix: np.ndarray) -> np.ndarray:
     """Compute Channel Impulse Response via IFFT for each frame."""
+    # The CSI matrix H[t, m] is the channel transfer function sampled at
+    # discrete subcarrier frequencies.  The IFFT along the frequency axis
+    # transforms it to the delay (time-of-flight) domain, yielding the channel
+    # impulse response h[t, τ].  Each tap τ corresponds to a multipath delay
+    # of τ / bandwidth seconds (tap spacing = 1 / (N × subcarrier spacing)).
+    # Breathing-induced chest movement shifts the dominant multipath tap
+    # amplitude over time, making the CIR a useful complementary view.
     return np.fft.ifft(csi_matrix, axis=1)
 
 
@@ -904,12 +1000,20 @@ def plot_comprehensive_analysis(
     ts_raw = dataset.timestamps_s
     fs_raw = dataset.estimated_fs
 
-    # Reorder subcarriers to frequency order
+    # Both steps below are required before any spectral analysis:
+    # 1. reorder_subcarriers maps storage order to frequency order so that
+    #    subcarrier indices are monotonically increasing in frequency and the
+    #    valid-mask indices align correctly.
+    # 2. resample_uniform converts the non-uniform ESP32 timestamps to a
+    #    regular grid; without this, FFT and autocorrelation results are
+    #    meaningless because they assume equal time spacing.
     csi_ordered_raw = reorder_subcarriers(csi_raw)
     valid_mask = get_valid_subcarrier_mask(M)
 
-    # Resample to uniform grid for spectral analysis
-    # Target: ~30 Hz (Nyquist well above 0.5 Hz breathing band)
+    # Nyquist reasoning: the breathing band tops at 0.5 Hz, so any rate above
+    # ~1 Hz satisfies Nyquist; 20 Hz gives a comfortable 40× oversampling
+    # margin.  We cap at 50 Hz to avoid allocating a huge resampled array for
+    # devices that report CSI at 100+ Hz.
     target_fs = min(max(20.0, fs_raw), 50.0)
     csi_ordered, ts, fs = resample_uniform(csi_ordered_raw, ts_raw, target_fs)
     T = len(ts)
@@ -935,6 +1039,15 @@ def plot_comprehensive_analysis(
 
     # =====================================================================
     # Figure 1: Raw CSI Overview
+    # Subplot layout:
+    #   [0,0] CSI amplitude heatmap — shows which subcarriers are active and
+    #         whether amplitude varies with time (breathing modulates this).
+    #   [0,1] CSI phase heatmap — reveals phase wrapping patterns and the
+    #         SFO-induced frequency slope across subcarriers.
+    #   [1,0] RSSI time series — overall link quality; sharp drops may flag
+    #         corrupted frames that should be excluded.
+    #   [1,1] Mean subcarrier amplitude bar chart — green bars are valid data
+    #         subcarriers; red are guard/pilot/DC tones excluded from analysis.
     # =====================================================================
     fig1, axes1 = plt.subplots(2, 2, figsize=(14, 10))
     fig1.suptitle("CSI Data Overview", fontsize=14, fontweight="bold")
@@ -987,6 +1100,11 @@ def plot_comprehensive_analysis(
 
     # =====================================================================
     # Figure 2: CIR Analysis
+    # The delay-domain (CIR) view separates multipath components by their
+    # time-of-flight.  A breathing subject slightly shifts the path length
+    # of one or more dominant taps, causing their amplitude to oscillate at
+    # the breathing rate.  This can be easier to detect than the frequency-
+    # domain CSI when the target is spatially isolated in the delay profile.
     # =====================================================================
     fig2, axes2 = plt.subplots(1, 2, figsize=(14, 5))
     fig2.suptitle("Channel Impulse Response Analysis", fontsize=14, fontweight="bold")
@@ -1206,6 +1324,11 @@ def plot_comprehensive_analysis(
 
     # =====================================================================
     # Figure 6: Complex Plane / Constellation
+    # If breathing is the dominant channel variation, the CSI phasor for the
+    # selected subcarrier traces a circular arc in the I-Q plane: the amplitude
+    # (radius) is roughly constant while the phase (angle) oscillates.  A
+    # well-defined arc is a visual indicator of pure phase modulation from
+    # breathing.  Scattered or irregular patterns suggest noise or body motion.
     # =====================================================================
     fig6, axes6 = plt.subplots(1, len(methods), figsize=(8 * len(methods), 5))
     if len(methods) == 1:
@@ -1308,6 +1431,10 @@ def plot_comprehensive_analysis(
     # Figure 8: Breathing waveform with detected peaks (best method)
     # =====================================================================
     if not short_data:
+        # Select the method whose filtered signal has the largest peak-to-peak
+        # amplitude as a proxy for SNR: a higher amplitude relative to other
+        # methods means breathing modulates that feature more strongly, giving
+        # more reliable peak detection and rate estimation.
         best_method = max(
             results.keys(), key=lambda m: np.max(np.abs(results[m]["filtered"]))
         )
