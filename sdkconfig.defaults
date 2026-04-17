@@ -45,6 +45,13 @@ CONFIG_ESP32_DEFAULT_CPU_FREQ_MHZ=240
 CONFIG_ESP32_WIFI_DYNAMIC_TX_BUFFER_NUM=32
 
 #
+# lwIP — TCP keepalive socket options (TCP_KEEPIDLE/INTVL/CNT).
+# Needed so the ESP32 detects a silently-dead capture host within ~11 s
+# instead of piling bytes into kernel send buffers for hours.
+#
+CONFIG_LWIP_TCP_KEEPALIVE=y
+
+#
 # ESP32S3-specific
 #
 CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240=y
