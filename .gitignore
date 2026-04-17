@@ -5,3 +5,5 @@ dependencies.lock
 .DS_Store
 /.cache
 /managed_components/
+__pycache__/
+*.pyc

@@ -38,6 +38,7 @@
 #include "esp_event.h"
 #include "esp_now.h"
 #include "esp_smartconfig.h"
+#include "esp_timer.h"
 
 #include "lwip/inet.h"
 #include "lwip/netdb.h"
@@ -63,8 +64,28 @@
    Worst case: header (~120 B) + 128 CSI bytes as "%d," (~640 B) + overhead */
 #define TCP_TX_BUF_SIZE         1024
 
-/* Reconnect delay if the TCP connection drops */
-#define TCP_RECONNECT_DELAY_MS  1000
+/* Exponential backoff for TCP reconnection (milliseconds). Starts at
+   TCP_RECONNECT_BACKOFF_MIN_MS after a failure, doubles on each failure, caps
+   at TCP_RECONNECT_BACKOFF_MAX_MS. Resets to MIN on a successful connect. */
+#define TCP_RECONNECT_BACKOFF_MIN_MS    500
+#define TCP_RECONNECT_BACKOFF_MAX_MS    30000
+
+/* Poll interval while the TCP connection is up (used to drive the 1 Hz
+   heartbeat when no CSI has been sent recently). */
+#define TCP_CONNECTED_POLL_MS           500
+
+/* Heartbeat line is emitted when this long has passed since the last send. */
+#define TCP_HEARTBEAT_INTERVAL_US       1000000  /* 1 s */
+
+/* Wi-Fi reconnect backoff (milliseconds). Never erases NVS once we have
+   successfully associated at least once — transient AP glitches overnight
+   must not wipe credentials. */
+#define WIFI_RECONNECT_BACKOFF_MIN_MS   500
+#define WIFI_RECONNECT_BACKOFF_MAX_MS   30000
+
+/* Auth-class failures allowed *before first successful association only*
+   before NVS is erased and ESPTouch re-provisioning is triggered. */
+#define WIFI_AUTH_FAIL_THRESHOLD        5
 
 #if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C61
 #define CSI_FORCE_LLTF          0
@@ -84,11 +105,17 @@
 
 static const char *TAG = "csi_recv_router";
 
-/* ── TCP state ──────────────────────────────────────────────────────────── */
+/* ── TCP + Wi-Fi state ──────────────────────────────────────────────────── */
 
 static int          s_tcp_sock   = -1;          /* socket fd, -1 = disconnected */
-static SemaphoreHandle_t s_tcp_mutex = NULL;    /* guards s_tcp_sock              */
-static bool         s_header_sent = false;      /* have we sent the CSV header?   */
+static SemaphoreHandle_t s_tcp_mutex = NULL;    /* guards all fields below      */
+static bool         s_header_sent = false;      /* have we sent the CSV header?  */
+static int64_t      s_last_tx_us  = 0;          /* esp_timer_get_time() of last successful send */
+
+/* Observability fields for the periodic heartbeat line. Updated from the
+   Wi-Fi event handler; read from tcp_reconnect_task under s_tcp_mutex. */
+static uint32_t     s_reconnect_count  = 0;     /* Wi-Fi associations since boot */
+static int          s_last_disc_reason = 0;     /* last WIFI_EVENT_STA_DISCONNECTED reason */
 
 /* ── TCP helpers ─────────────────────────────────────────────────────────── */
 
@@ -114,9 +141,20 @@ static int tcp_connect(void)
         return -1;
     }
 
-    /* Keep-alive so the OS detects a dead connection */
+    /* Keep-alive so the OS detects a dead connection.
+       The default lwIP idle (~2 h) is useless for an overnight 100 Hz stream
+       where the capture host could suspend its Wi-Fi at any moment. Tight
+       values guarantee we notice a dead peer within ~idle + intvl * cnt
+       = 5 + 2*3 = 11 s and trigger reconnect instead of silently piling
+       bytes into kernel send buffers. */
     int keep = 1;
     setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &keep, sizeof(keep));
+    int keep_idle  = 5;   /* seconds of idle before probes start */
+    int keep_intvl = 2;   /* seconds between probes */
+    int keep_cnt   = 3;   /* dead after this many missed probes */
+    setsockopt(sock, IPPROTO_TCP, TCP_KEEPIDLE,  &keep_idle,  sizeof(keep_idle));
+    setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, &keep_intvl, sizeof(keep_intvl));
+    setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT,   &keep_cnt,   sizeof(keep_cnt));
 
     /* Send buffer — lwIP default is fine, but be explicit */
     int sndbuf = TCP_TX_BUF_SIZE * 4;
@@ -154,14 +192,50 @@ static void tcp_send_locked(const char *buf, int len)
         }
         sent += n;
     }
+    /* Drives the 1 Hz heartbeat in tcp_reconnect_task. */
+    s_last_tx_us = esp_timer_get_time();
 }
 
 /**
- * Background task: keeps the TCP connection alive, reconnecting
- * whenever it drops.
+ * Emit a one-line heartbeat so the capture host can detect a silent link
+ * even during long periods with no CSI (e.g. AP channel switch). Called
+ * from tcp_reconnect_task when no send has happened in the last second.
+ * Must be called with s_tcp_mutex held.
+ */
+static void tcp_send_heartbeat_locked(void)
+{
+    if (s_tcp_sock < 0 || !s_header_sent) return;
+
+    wifi_ap_record_t ap = {0};
+    int rssi = 0;
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) rssi = ap.rssi;
+
+    int64_t now_us    = esp_timer_get_time();
+    uint32_t uptime_s = (uint32_t)(now_us / 1000000);
+
+    char line[96];
+    int pos = snprintf(line, sizeof(line),
+        "HEARTBEAT,%lld,%d,%lu,%lu,%d\n",
+        (long long)now_us, rssi,
+        (unsigned long)uptime_s,
+        (unsigned long)s_reconnect_count,
+        s_last_disc_reason);
+    if (pos > 0 && pos < (int)sizeof(line)) {
+        tcp_send_locked(line, pos);
+    }
+}
+
+/**
+ * Background task: keeps the TCP connection alive, reconnecting whenever
+ * it drops, and emitting a 1 Hz heartbeat while connected.
+ *
+ * Reconnect uses exponential backoff (500 ms → 30 s) so a long host outage
+ * doesn't hammer the network, but a quick bounce recovers within ~500 ms.
  */
 static void tcp_reconnect_task(void *arg)
 {
+    uint32_t backoff_ms = TCP_RECONNECT_BACKOFF_MIN_MS;
+
     while (true) {
         xSemaphoreTake(s_tcp_mutex, portMAX_DELAY);
         bool connected = (s_tcp_sock >= 0);
@@ -172,13 +246,31 @@ static void tcp_reconnect_task(void *arg)
             xSemaphoreTake(s_tcp_mutex, portMAX_DELAY);
             s_tcp_sock    = sock;
             s_header_sent = false;   /* re-send header on new connection */
+            if (sock >= 0) {
+                s_last_tx_us = esp_timer_get_time();
+            }
             xSemaphoreGive(s_tcp_mutex);
 
             if (sock < 0) {
-                vTaskDelay(pdMS_TO_TICKS(TCP_RECONNECT_DELAY_MS));
+                vTaskDelay(pdMS_TO_TICKS(backoff_ms));
+                backoff_ms <<= 1;
+                if (backoff_ms > TCP_RECONNECT_BACKOFF_MAX_MS) {
+                    backoff_ms = TCP_RECONNECT_BACKOFF_MAX_MS;
+                }
+            } else {
+                backoff_ms = TCP_RECONNECT_BACKOFF_MIN_MS;
             }
         } else {
-            vTaskDelay(pdMS_TO_TICKS(200));
+            /* Connected: poll slowly and emit a heartbeat if the CSI path
+               has been quiet for ≥1 s. */
+            xSemaphoreTake(s_tcp_mutex, portMAX_DELAY);
+            int64_t idle_us = esp_timer_get_time() - s_last_tx_us;
+            if (s_tcp_sock >= 0 && idle_us >= TCP_HEARTBEAT_INTERVAL_US) {
+                tcp_send_heartbeat_locked();
+            }
+            xSemaphoreGive(s_tcp_mutex);
+
+            vTaskDelay(pdMS_TO_TICKS(TCP_CONNECTED_POLL_MS));
         }
     }
 }
@@ -409,15 +501,63 @@ static esp_err_t wifi_ping_router_start(void)
 #define NVS_NAMESPACE   "wifi_creds"
 #define NVS_KEY_SSID    "ssid"
 #define NVS_KEY_PASS    "password"
-#define WIFI_MAX_RETRY  5
 
 #define WIFI_CONNECTED_BIT  BIT0
 #define WIFI_FAIL_BIT       BIT1
 #define ESPTOUCH_DONE_BIT   BIT2
 
 static EventGroupHandle_t s_wifi_event_group;
-static int  s_retry_count      = 0;
-static bool s_has_stored_creds = false;
+static bool s_has_stored_creds  = false;
+/* Latched true on first successful IP_EVENT_STA_GOT_IP and never cleared.
+   Used to prevent NVS credential erasure after a mid-night disconnect —
+   overnight glitches must not disable the sensor until morning. */
+static bool s_ever_connected    = false;
+static int  s_auth_fail_count   = 0;   /* consecutive auth-class failures before first association */
+static int  s_reconnect_attempt = 0;   /* exponential-backoff counter, reset on GOT_IP */
+static esp_timer_handle_t s_wifi_reconnect_timer = NULL;
+
+/* Helpers for the reason-aware disconnect policy. */
+static bool wifi_reason_is_auth(int reason)
+{
+    switch (reason) {
+        case WIFI_REASON_AUTH_FAIL:
+        case WIFI_REASON_AUTH_EXPIRE:
+        case WIFI_REASON_HANDSHAKE_TIMEOUT:
+        case WIFI_REASON_MIC_FAILURE:
+        case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static void wifi_reconnect_timer_cb(void *arg)
+{
+    esp_err_t err = esp_wifi_connect();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "esp_wifi_connect() in backoff cb: %s", esp_err_to_name(err));
+    }
+}
+
+/* Schedule the next esp_wifi_connect() after `delay_ms` without blocking
+   the default event loop task. Creates the one-shot timer on first use. */
+static void wifi_schedule_reconnect(uint32_t delay_ms)
+{
+    if (s_wifi_reconnect_timer == NULL) {
+        const esp_timer_create_args_t args = {
+            .callback = &wifi_reconnect_timer_cb,
+            .name     = "wifi_reconn",
+        };
+        if (esp_timer_create(&args, &s_wifi_reconnect_timer) != ESP_OK) {
+            /* Fall back to an immediate connect; worst case the next
+               disconnect schedules it again. */
+            esp_wifi_connect();
+            return;
+        }
+    }
+    esp_timer_stop(s_wifi_reconnect_timer);   /* harmless if not armed */
+    esp_timer_start_once(s_wifi_reconnect_timer, (uint64_t)delay_ms * 1000);
+}
 
 static bool load_wifi_credentials(char *ssid, size_t ssid_len,
                                    char *password, size_t pass_len)
@@ -477,19 +617,63 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         }
 
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        if (s_retry_count < WIFI_MAX_RETRY) {
-            esp_wifi_connect();
-            s_retry_count++;
-            ESP_LOGI(TAG, "WiFi retry %d/%d", s_retry_count, WIFI_MAX_RETRY);
+        wifi_event_sta_disconnected_t *ev =
+            (wifi_event_sta_disconnected_t *)event_data;
+        int reason = ev ? ev->reason : 0;
+
+        /* Publish the reason so the heartbeat line can report it. The 64-bit
+           s_last_tx_us and this 32-bit field are both read under s_tcp_mutex
+           from the reconnect task, but the write here is a single-word store
+           that any reader will either see old or new — either is fine. */
+        s_last_disc_reason = reason;
+
+        /* Compute exponential backoff: 500 ms, 1 s, 2 s, … capped at 30 s.
+           Reset to zero on GOT_IP. */
+        uint32_t delay_ms = WIFI_RECONNECT_BACKOFF_MIN_MS
+                            << (s_reconnect_attempt < 6 ? s_reconnect_attempt : 6);
+        if (delay_ms > WIFI_RECONNECT_BACKOFF_MAX_MS) {
+            delay_ms = WIFI_RECONNECT_BACKOFF_MAX_MS;
+        }
+        s_reconnect_attempt++;
+
+        if (s_ever_connected) {
+            /* Once we've been online, NEVER erase credentials and NEVER give
+               up — unattended overnight use must survive AP reboots, DFS
+               radar switches, channel hops, host laptop sleeping its Wi-Fi,
+               etc. Just keep retrying with backoff forever. */
+            ESP_LOGW(TAG, "WiFi disconnected (reason %d) — retry in %lu ms",
+                     reason, (unsigned long)delay_ms);
+            wifi_schedule_reconnect(delay_ms);
+        } else if (wifi_reason_is_auth(reason)) {
+            /* Auth-class failures during the *initial* association are the
+               only situation where we erase NVS and fall back to ESPTouch —
+               this catches truly-bad stored credentials. Requires several in
+               a row so a one-off handshake glitch doesn't trigger it. */
+            s_auth_fail_count++;
+            ESP_LOGW(TAG, "WiFi auth failure %d/%d (reason %d) during initial connect",
+                     s_auth_fail_count, WIFI_AUTH_FAIL_THRESHOLD, reason);
+            if (s_auth_fail_count >= WIFI_AUTH_FAIL_THRESHOLD) {
+                ESP_LOGE(TAG, "Stored credentials rejected — will erase and re-provision");
+                xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+            } else {
+                wifi_schedule_reconnect(delay_ms);
+            }
         } else {
-            ESP_LOGE(TAG, "WiFi connection failed after %d retries", WIFI_MAX_RETRY);
-            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+            /* Non-auth failures during the initial connect (AP not found,
+               beacon timeout, …) — keep trying forever. The AP might just be
+               slow to come up after a power cycle. */
+            ESP_LOGW(TAG, "WiFi initial connect failed (reason %d) — retry in %lu ms",
+                     reason, (unsigned long)delay_ms);
+            wifi_schedule_reconnect(delay_ms);
         }
 
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
-        s_retry_count = 0;
+        s_reconnect_attempt = 0;
+        s_auth_fail_count   = 0;
+        s_ever_connected    = true;
+        s_reconnect_count++;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
 
     } else if (event_base == SC_EVENT && event_id == SC_EVENT_SCAN_DONE) {
@@ -555,13 +739,16 @@ static void wifi_init(void)
 
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    /* Block until connected or all retries exhausted */
+    /* Block until we get an IP, or stored credentials are rejected as bad.
+       WIFI_FAIL_BIT is now set ONLY after WIFI_AUTH_FAIL_THRESHOLD consecutive
+       auth-class failures before the first successful association — so a
+       flaky AP that eventually comes back won't trigger credential erasure. */
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
                                            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
                                            false, false, portMAX_DELAY);
 
     if (bits & WIFI_FAIL_BIT) {
-        ESP_LOGE(TAG, "Could not connect with stored credentials — erasing and restarting");
+        ESP_LOGE(TAG, "Stored credentials look genuinely bad — erasing and restarting");
         erase_wifi_credentials();
         esp_restart();
     }

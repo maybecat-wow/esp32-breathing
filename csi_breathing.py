@@ -111,9 +111,46 @@ class CSIDataset:
     frames: list = field(default_factory=list)
     skipped_rows: int = 0  # lines that failed to parse (malformed/incomplete)
 
+    # Frame indices at which a new contiguous segment begins — populated by
+    # _parse_csv when it encounters `CSI_GAP` marker rows produced by
+    # capture.py during overnight dropouts. Each entry is `len(frames)` at
+    # the moment the gap row was seen, i.e. the index of the first CSI_DATA
+    # frame after the gap.
+    gap_indices: list = field(default_factory=list)
+
     @property
     def num_frames(self) -> int:
         return len(self.frames)
+
+    def segment_spans(self) -> list:
+        """Return [(start, end), …] frame-index ranges for each gap-free span.
+
+        End indices are exclusive, half-open Python slice style. Empty
+        gap_indices yields a single span covering the whole dataset.
+        Spans with zero length (repeated gaps with no frames between them)
+        are filtered out.
+        """
+        n = self.num_frames
+        if n == 0:
+            return []
+        bounds = [0] + [g for g in self.gap_indices if 0 < g < n] + [n]
+        return [(bounds[i], bounds[i + 1])
+                for i in range(len(bounds) - 1)
+                if bounds[i + 1] > bounds[i]]
+
+    def longest_segment(self) -> tuple:
+        """Return the (start, end) of the longest gap-free span."""
+        spans = self.segment_spans()
+        if not spans:
+            return (0, 0)
+        return max(spans, key=lambda s: s[1] - s[0])
+
+    def slice(self, start: int, end: int) -> "CSIDataset":
+        """Return a new CSIDataset containing only frames[start:end].
+        gap_indices is empty in the slice since segments are gap-free."""
+        out = CSIDataset(frames=self.frames[start:end])
+        out.skipped_rows = self.skipped_rows
+        return out
 
     @property
     def timestamps_us(self) -> np.ndarray:
@@ -322,7 +359,19 @@ def _parse_csv(filepath: str) -> CSIDataset:
         col_idx = {name.strip(): i for i, name in enumerate(header)}
 
         for row in reader:
-            if not row or row[0].strip() != "CSI_DATA":
+            if not row:
+                continue
+            row_type = row[0].strip()
+            if row_type == "CSI_GAP":
+                # Mark a segment boundary at the next CSI_DATA index.
+                # Dedupe consecutive gaps (they can only be produced by a
+                # future change to capture.py; the current one already
+                # dedupes, but belt-and-braces).
+                idx = len(dataset.frames)
+                if not dataset.gap_indices or dataset.gap_indices[-1] != idx:
+                    dataset.gap_indices.append(idx)
+                continue
+            if row_type != "CSI_DATA":
                 continue
 
             try:
@@ -990,10 +1039,31 @@ def plot_comprehensive_analysis(
     output_dir: str,
     methods: list = None,
 ):
-    """Generate comprehensive visualization of CSI breathing analysis."""
+    """Generate comprehensive visualization of CSI breathing analysis.
+
+    If the dataset contains gap markers (i.e. the overnight capture.py
+    detected one or more TCP/Wi-Fi dropouts), the analysis below is run on
+    the longest gap-free segment only — interpolating across an outage would
+    corrupt the FFT/autocorrelation of breathing variability. Use the
+    `--sliding` CLI mode to get a per-segment breathing-rate-vs-time view
+    across the whole night.
+    """
 
     if methods is None:
         methods = ["ratio", "amplitude", "phase"]
+
+    if dataset.gap_indices:
+        start, end = dataset.longest_segment()
+        total = dataset.num_frames
+        print(
+            f"  [gap] {len(dataset.gap_indices)} dropout(s) detected — "
+            f"analysing longest segment ({start}:{end}, "
+            f"{end - start}/{total} frames)"
+        )
+        dataset = dataset.slice(start, end)
+        if dataset.num_frames == 0:
+            print("  [gap] Longest segment is empty; nothing to analyse.")
+            return
 
     csi_raw = dataset.csi_matrix()
     T_raw, M = csi_raw.shape
@@ -1496,6 +1566,130 @@ def plot_comprehensive_analysis(
 # ---------------------------------------------------------------------------
 
 
+def _estimate_rate_for_window(dataset: CSIDataset, method: str) -> float:
+    """Run the core breathing-rate estimator on a short window and return the
+    estimated rate in BPM, or NaN if the window is unusable."""
+    n = dataset.num_frames
+    if n < 50:
+        return float("nan")
+    csi_raw = dataset.csi_matrix()
+    _, M = csi_raw.shape
+    csi_ordered_raw = reorder_subcarriers(csi_raw)
+    valid_mask = get_valid_subcarrier_mask(M)
+    target_fs = min(max(20.0, dataset.estimated_fs), 50.0)
+    try:
+        csi_ordered, _, fs = resample_uniform(
+            csi_ordered_raw, dataset.timestamps_s, target_fs
+        )
+        breath_raw, _, _ = extract_breathing_signal(
+            csi_ordered, fs, method=method, valid_mask=valid_mask
+        )
+        filtered = bandpass_filter(breath_raw, fs, BREATH_FREQ_LO, BREATH_FREQ_HI)
+        rate, _, _, _, reason = estimate_breathing_rate_psd(filtered, fs)
+        if reason:
+            return float("nan")
+        return float(rate)
+    except (ValueError, RuntimeError, np.linalg.LinAlgError):
+        return float("nan")
+
+
+def _run_sliding(dataset: CSIDataset, output_dir: str, methods: list,
+                 window_s: float, stride_s: float) -> None:
+    """Overnight breathing-rate vs time plot.
+
+    Segments the recording on `CSI_GAP` markers from capture.py, then runs
+    the per-method estimator on sliding windows (window_s wide, stride_s
+    apart) inside each segment. Produces `<output_dir>/sliding_breathing.png`
+    — the actual sleep-quality signal: breathing rate trajectory through the
+    night, with blank bands at dropouts instead of smoothed bridges.
+    """
+    import matplotlib.pyplot as plt
+
+    os.makedirs(output_dir, exist_ok=True)
+    spans = dataset.segment_spans()
+    if not spans:
+        print("  [sliding] No frames to analyse.")
+        return
+
+    t0_us = float(dataset.frames[0].local_timestamp)
+
+    print(f"  [sliding] {len(spans)} segment(s); "
+          f"window={window_s}s stride={stride_s}s; methods={methods}")
+
+    per_method_times = {m: [] for m in methods}
+    per_method_rates = {m: [] for m in methods}
+
+    for span_i, (start, end) in enumerate(spans):
+        seg = dataset.slice(start, end)
+        fs_est = seg.estimated_fs
+        if seg.num_frames < 50 or fs_est <= 0:
+            continue
+        seg_duration = seg.duration_s
+        if seg_duration < window_s:
+            # Still run the whole segment as one window so short segments
+            # aren't lost entirely.
+            t_center = (
+                seg.frames[0].local_timestamp
+                + (seg.frames[-1].local_timestamp - seg.frames[0].local_timestamp) / 2.0
+            )
+            t_center_s = (t_center - t0_us) / 1e6
+            for m in methods:
+                rate = _estimate_rate_for_window(seg, m)
+                per_method_times[m].append(t_center_s)
+                per_method_rates[m].append(rate)
+            continue
+
+        n_window = int(round(window_s * fs_est))
+        n_stride = max(1, int(round(stride_s * fs_est)))
+        for i in range(0, seg.num_frames - n_window + 1, n_stride):
+            win = seg.slice(i, i + n_window)
+            t_center_us = (
+                win.frames[0].local_timestamp
+                + (win.frames[-1].local_timestamp - win.frames[0].local_timestamp) / 2.0
+            )
+            t_center_s = (t_center_us - t0_us) / 1e6
+            for m in methods:
+                rate = _estimate_rate_for_window(win, m)
+                per_method_times[m].append(t_center_s)
+                per_method_rates[m].append(rate)
+
+        print(f"  [sliding] segment {span_i}: {seg.num_frames} frames, "
+              f"{seg_duration:.1f}s")
+
+    fig, ax = plt.subplots(figsize=(14, 5))
+    colors = {"ratio": "tab:blue", "amplitude": "tab:orange", "phase": "tab:green"}
+    any_points = False
+    for m in methods:
+        ts = np.array(per_method_times[m])
+        rs = np.array(per_method_rates[m])
+        if len(ts) == 0:
+            continue
+        any_points = True
+        ax.plot(ts / 3600.0, rs, ".-", label=m, color=colors.get(m),
+                markersize=3, linewidth=1)
+    if any_points:
+        for gap_idx in dataset.gap_indices:
+            if 0 < gap_idx < dataset.num_frames:
+                t_gap = (dataset.frames[gap_idx].local_timestamp - t0_us) / 1e6 / 3600.0
+                ax.axvline(t_gap, color="red", alpha=0.2, linewidth=1)
+        ax.set_xlabel("Time since start (hours)")
+        ax.set_ylabel("Breathing rate (BPM)")
+        ax.set_ylim(BREATH_FREQ_LO * 60 - 2, BREATH_FREQ_HI * 60 + 2)
+        ax.set_title(f"Breathing rate vs time  "
+                     f"(window={window_s:.0f}s, stride={stride_s:.0f}s, "
+                     f"{len(dataset.gap_indices)} gaps)")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        out_path = os.path.join(output_dir, "sliding_breathing.png")
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=120)
+        plt.close(fig)
+        print(f"  [sliding] wrote {out_path}")
+    else:
+        plt.close(fig)
+        print("  [sliding] no windows produced a valid rate estimate.")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="ESP32 CSI Breathing Rate Analysis",
@@ -1505,12 +1699,18 @@ Examples:
     python csi_breathing.py CSI_DATA.txt
     python csi_breathing.py CSI_DATA.txt --output-dir results
     python csi_breathing.py CSI_DATA.txt --methods ratio amplitude phase
+    python csi_breathing.py night.csv --sliding --window 60 --stride 10
 
 Methods:
     ratio        - Cross-subcarrier ratio: conjugate product against a reference
                    subcarrier cancels hardware phase noise; BoI selects the best pair
     amplitude    - Band-of-Interest subcarrier selection on amplitude
     phase        - Phase-based with linear detrending
+
+Sleep-quality mode:
+    --sliding    - Plot breathing rate vs time across the whole overnight
+                   recording. Segments on CSI_GAP markers emitted by capture.py
+                   so dropouts appear as blank bands, not smoothed bridges.
 
 References:
     [1] Espressif ESP-CSI: https://github.com/espressif/esp-csi
@@ -1531,6 +1731,24 @@ References:
         choices=["ratio", "amplitude", "phase"],
         help="Analysis methods to run",
     )
+    parser.add_argument(
+        "--sliding",
+        action="store_true",
+        help="Run sliding-window breathing-rate-vs-time analysis across the "
+             "whole recording (designed for overnight sleep-quality captures)",
+    )
+    parser.add_argument(
+        "--window",
+        type=float,
+        default=60.0,
+        help="Sliding window width in seconds (default: 60)",
+    )
+    parser.add_argument(
+        "--stride",
+        type=float,
+        default=10.0,
+        help="Sliding window stride in seconds (default: 10)",
+    )
 
     args = parser.parse_args()
 
@@ -1546,9 +1764,14 @@ References:
         sys.exit(1)
 
     skipped_info = f" ({dataset.skipped_rows} malformed rows skipped)" if dataset.skipped_rows > 0 else ""
-    print(f"  Parsed {dataset.num_frames} CSI frames{skipped_info}")
+    gap_info = f" ({len(dataset.gap_indices)} dropout(s) marked)" if dataset.gap_indices else ""
+    print(f"  Parsed {dataset.num_frames} CSI frames{skipped_info}{gap_info}")
 
-    plot_comprehensive_analysis(dataset, args.output_dir, methods=args.methods)
+    if args.sliding:
+        _run_sliding(dataset, args.output_dir, args.methods,
+                     args.window, args.stride)
+    else:
+        plot_comprehensive_analysis(dataset, args.output_dir, methods=args.methods)
 
 
 if __name__ == "__main__":
