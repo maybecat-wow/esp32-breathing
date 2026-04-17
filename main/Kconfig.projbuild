@@ -1,0 +1,27 @@
+menu "CSI Breathing Monitor"
+
+    config CSI_TCP_HOST
+        string "Capture machine IP address"
+        default "192.168.0.100"
+        help
+            IPv4 address of the host machine running capture.py.
+            The ESP32 connects here as a TCP client and streams CSI rows.
+
+    config CSI_TCP_PORT
+        int "TCP port"
+        default 3490
+        range 1024 65535
+        help
+            TCP port on which capture.py is listening (default 3490).
+
+    config SEND_FREQUENCY
+        int "Ping rate (Hz)"
+        default 100
+        range 10 1000
+        help
+            How many ICMP pings per second are sent to the gateway.
+            Each ping triggers one CSI frame, so this is the CSI sample rate.
+            Higher values give better time resolution but increase CPU and
+            network load. 100 Hz is the recommended default.
+
+endmenu

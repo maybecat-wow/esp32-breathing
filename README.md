@@ -46,16 +46,19 @@ PyWavelets is optional — if absent, DWT-based filtering is skipped and the too
 
 ### 1. Configure the host IP
 
-Edit `main/app_main.c` line 55 and set `CONFIG_CSI_TCP_HOST` to the IP address of the machine that will run `capture.py`:
-
-```c
-#define CONFIG_CSI_TCP_HOST  "192.168.x.x"   // ← your machine's IP
-```
-
-Alternatively, set it through menuconfig:
+Run menuconfig and set the IP under **CSI Breathing Monitor → Capture machine IP address**:
 
 ```sh
-idf.py menuconfig   # Component config → CSI TCP output → Host IP
+idf.py menuconfig
+# navigate to: CSI Breathing Monitor → Capture machine IP address
+```
+
+Or open `main/Kconfig.projbuild` and change the `default` value, then rebuild — this avoids touching the C source:
+
+```
+config CSI_TCP_HOST
+    string "Capture machine IP address"
+    default "192.168.x.x"   # ← set this to your machine's IP
 ```
 
 ### 2. Flash the firmware
@@ -174,7 +177,7 @@ The `data` field is a JSON integer array — 128 bytes representing 64 complex s
 
 ## Firmware Configuration
 
-Key parameters in `main/app_main.c`:
+Key parameters are exposed via `idf.py menuconfig` under **CSI Breathing Monitor** (defined in `main/Kconfig.projbuild`):
 
 | Symbol | Default | Description |
 |--------|---------|-------------|
