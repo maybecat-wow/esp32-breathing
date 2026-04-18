@@ -8,11 +8,12 @@
    CSI frames are sent as newline-terminated CSV over a persistent TCP
    connection to a host running capture.py.
 
-   Menuconfig (Component config → CSI TCP output):
-     CONFIG_CSI_TCP_HOST  — host IP of the capture machine
-     CONFIG_CSI_TCP_PORT  — TCP port (default 3490)
+   Menuconfig (idf.py menuconfig → CSI Breathing Monitor):
+     CONFIG_CSI_TCP_HOST    — host IP of the capture machine
+     CONFIG_CSI_TCP_PORT    — TCP port (default 3490)
+     CONFIG_SEND_FREQUENCY  — ping / CSI sample rate in Hz (default 100)
 
-   Or set the defaults below directly if not using menuconfig.
+   Defaults are set in main/Kconfig.projbuild.
 
    Wi-Fi provisioning:
      First boot: device enters ESPTouch mode. Use the Espressif EspTouch
@@ -50,15 +51,9 @@
 
 /* ── Configuration ──────────────────────────────────────────────────────── */
 
-#define CONFIG_SEND_FREQUENCY   100
-
-#ifndef CONFIG_CSI_TCP_HOST
-#define CONFIG_CSI_TCP_HOST     "192.168.0.100"   /* ← set to your Mac's IP */
-#endif
-
-#ifndef CONFIG_CSI_TCP_PORT
-#define CONFIG_CSI_TCP_PORT     3490
-#endif
+/* CONFIG_SEND_FREQUENCY, CONFIG_CSI_TCP_HOST, and CONFIG_CSI_TCP_PORT are
+ * provided by Kconfig (main/Kconfig.projbuild) and configurable via
+ * idf.py menuconfig under "CSI Breathing Monitor". */
 
 /* How large a single CSV line can be.
    Worst case: header (~120 B) + 128 CSI bytes as "%d," (~640 B) + overhead */
