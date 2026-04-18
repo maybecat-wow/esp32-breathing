@@ -27,6 +27,7 @@
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
 #include "freertos/semphr.h"
+#include "freertos/stream_buffer.h"
 
 #include "nvs_flash.h"
 #include "nvs.h"
@@ -112,6 +113,19 @@ static int64_t      s_last_tx_us  = 0;          /* esp_timer_get_time() of last 
 static uint32_t     s_reconnect_count  = 0;     /* Wi-Fi associations since boot */
 static int          s_last_disc_reason = 0;     /* last WIFI_EVENT_STA_DISCONNECTED reason */
 
+/* CSI-frame observability. Incremented from wifi_csi_rx_cb, read by the
+   reconnect task for periodic "alive" logging. Single-word updates, no mutex. */
+static volatile uint32_t s_csi_frames_total    = 0;  /* callback invocations */
+static volatile uint32_t s_csi_frames_accepted = 0;  /* passed BSSID filter */
+static volatile uint32_t s_csi_frames_dropped  = 0;  /* stream buffer full  */
+
+/* Byte stream buffer connecting the CSI callback (producer) to the writer
+   task (consumer). Sized to hold ~10 full CSV rows so short network stalls
+   don't drop frames while still bounding RAM. A blocking send() now only
+   ever stalls the writer task, never the Wi-Fi task. */
+#define CSI_STREAM_BUF_BYTES   8192
+static StreamBufferHandle_t s_tx_stream = NULL;
+
 /* ── TCP helpers ─────────────────────────────────────────────────────────── */
 
 /**
@@ -192,6 +206,30 @@ static void tcp_send_locked(const char *buf, int len)
 }
 
 /**
+ * Write the CSV header. Must be called with s_tcp_mutex held.
+ * Idempotent: no-op if already sent on this socket.
+ */
+static void tcp_send_header_locked(void)
+{
+    if (s_tcp_sock < 0 || s_header_sent) return;
+    char buf[TCP_TX_BUF_SIZE];
+    int pos;
+#if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32C61
+    pos = snprintf(buf, sizeof(buf),
+        "type,id,mac,rssi,rate,noise_floor,fft_gain,agc_gain,"
+        "channel,local_timestamp,sig_len,rx_state,len,first_word,data\n");
+#else
+    pos = snprintf(buf, sizeof(buf),
+        "type,id,mac,rssi,rate,sig_mode,mcs,bandwidth,smoothing,"
+        "not_sounding,aggregation,stbc,fec_coding,sgi,noise_floor,"
+        "ampdu_cnt,channel,secondary_channel,local_timestamp,ant,"
+        "sig_len,rx_state,len,first_word,data\n");
+#endif
+    tcp_send_locked(buf, pos);
+    s_header_sent = true;
+}
+
+/**
  * Emit a one-line heartbeat so the capture host can detect a silent link
  * even during long periods with no CSI (e.g. AP channel switch). Called
  * from tcp_reconnect_task when no send has happened in the last second.
@@ -221,6 +259,31 @@ static void tcp_send_heartbeat_locked(void)
 }
 
 /**
+ * Background task: drains the CSI stream buffer and sends bytes over TCP.
+ * Runs at a lower priority than the Wi-Fi task and is the ONLY place that
+ * does a blocking send(). Keeps the Wi-Fi task free of TCP back-pressure.
+ */
+static void tcp_writer_task(void *arg)
+{
+    static char buf[TCP_TX_BUF_SIZE];
+    while (true) {
+        /* Block until at least one byte is available. */
+        size_t n = xStreamBufferReceive(s_tx_stream, buf, sizeof(buf),
+                                        portMAX_DELAY);
+        if (n == 0) continue;
+
+        xSemaphoreTake(s_tcp_mutex, portMAX_DELAY);
+        /* Header is sent on connect from tcp_reconnect_task, so by the time
+           we have data the socket is either healthy or the reconnect task
+           is currently bringing it back up. In the latter case, drop. */
+        if (s_tcp_sock >= 0 && s_header_sent) {
+            tcp_send_locked(buf, (int)n);
+        }
+        xSemaphoreGive(s_tcp_mutex);
+    }
+}
+
+/**
  * Background task: keeps the TCP connection alive, reconnecting whenever
  * it drops, and emitting a 1 Hz heartbeat while connected.
  *
@@ -230,8 +293,35 @@ static void tcp_send_heartbeat_locked(void)
 static void tcp_reconnect_task(void *arg)
 {
     uint32_t backoff_ms = TCP_RECONNECT_BACKOFF_MIN_MS;
+    int64_t  last_stats_us = 0;
+    uint32_t last_total = 0, last_accepted = 0;
 
     while (true) {
+        /* Every ~5 s, report CSI frame counters to the serial monitor. Lets
+           operators see at a glance whether frames are arriving at all and
+           whether the BSSID filter is dropping them. */
+        int64_t now_us = esp_timer_get_time();
+        if (now_us - last_stats_us >= 5000000) {
+            uint32_t total    = s_csi_frames_total;
+            uint32_t accepted = s_csi_frames_accepted;
+            wifi_ap_record_t ap = {0};
+            int rssi = 0;
+            uint8_t channel = 0;
+            if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+                rssi    = ap.rssi;
+                channel = ap.primary;
+            }
+            ESP_LOGI(TAG,
+                "CSI stats: total=%lu (+%lu) accepted=%lu (+%lu) dropped=%lu rssi=%d ch=%u in 5 s",
+                (unsigned long)total,    (unsigned long)(total    - last_total),
+                (unsigned long)accepted, (unsigned long)(accepted - last_accepted),
+                (unsigned long)s_csi_frames_dropped,
+                rssi, channel);
+            last_total     = total;
+            last_accepted  = accepted;
+            last_stats_us  = now_us;
+        }
+
         xSemaphoreTake(s_tcp_mutex, portMAX_DELAY);
         bool connected = (s_tcp_sock >= 0);
         xSemaphoreGive(s_tcp_mutex);
@@ -243,6 +333,11 @@ static void tcp_reconnect_task(void *arg)
             s_header_sent = false;   /* re-send header on new connection */
             if (sock >= 0) {
                 s_last_tx_us = esp_timer_get_time();
+                /* Send header immediately so capture.py's recv timeout can't
+                   fire before the first CSI frame arrives (which may be never
+                   if ping is blocked). After this, heartbeats keep the link
+                   alive and diagnosable even with zero CSI. */
+                tcp_send_header_locked();
             }
             xSemaphoreGive(s_tcp_mutex);
 
@@ -279,16 +374,20 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
         return;
     }
 
+    s_csi_frames_total++;
+
     if (memcmp(info->mac, ctx, 6)) {
         return;
     }
 
-    /* Drop frame if not yet connected */
-    xSemaphoreTake(s_tcp_mutex, portMAX_DELAY);
-    if (s_tcp_sock < 0) {
-        xSemaphoreGive(s_tcp_mutex);
-        return;
-    }
+    s_csi_frames_accepted++;
+
+    /* Drop frame if no stream buffer (early boot) or not yet connected.
+       Checking s_tcp_sock is a plain int read — worst case we build a
+       line and push it to the queue, the writer task sees sock<0 and
+       discards on dequeue. We never take s_tcp_mutex here — the whole
+       point of the queue is to keep the Wi-Fi task off that lock. */
+    if (s_tx_stream == NULL) return;
 
     const wifi_pkt_rx_ctrl_t *rx_ctrl = &info->rx_ctrl;
     static int s_count = 0;
@@ -314,27 +413,12 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
              compensate_gain, agc_gain, fft_gain);
 #endif
 
-    /* Build the CSV line into a stack buffer */
+    /* Build the CSV line into a stack buffer. The whole line is built
+       entirely before we touch the stream buffer — so we only enqueue
+       once per frame, atomically, and the consumer never sees a torn
+       row even under back-pressure. */
     char buf[TCP_TX_BUF_SIZE];
     int  pos = 0;
-
-    /* ── CSV header (sent once per connection) ── */
-    if (!s_header_sent) {
-#if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32C61
-        pos = snprintf(buf, sizeof(buf),
-            "type,id,mac,rssi,rate,noise_floor,fft_gain,agc_gain,"
-            "channel,local_timestamp,sig_len,rx_state,len,first_word,data\n");
-#else
-        pos = snprintf(buf, sizeof(buf),
-            "type,id,mac,rssi,rate,sig_mode,mcs,bandwidth,smoothing,"
-            "not_sounding,aggregation,stbc,fec_coding,sgi,noise_floor,"
-            "ampdu_cnt,channel,secondary_channel,local_timestamp,ant,"
-            "sig_len,rx_state,len,first_word,data\n");
-#endif
-        tcp_send_locked(buf, pos);
-        s_header_sent = true;
-        pos = 0;
-    }
 
     /* ── CSI_DATA row — metadata fields ── */
 #if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32C61
@@ -367,19 +451,11 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
         (info->len - 2) / 2, info->first_word_invalid,
         (int16_t)(compensate_gain * csi_val));
 
-    /* Flush the header + first element before the loop */
-    tcp_send_locked(buf, pos);
-    pos = 0;
-
     for (int i = 2; i < (info->len - 2); i += 2) {
+        if (pos > TCP_TX_BUF_SIZE - 12) break;   /* drop rest of row if line would overflow */
         csi_val = (int16_t)(((((uint16_t)info->buf[i+1]) << 8) | info->buf[i]) << 4) >> 4;
         pos += snprintf(buf + pos, sizeof(buf) - pos,
             ",%d", (int16_t)(compensate_gain * csi_val));
-        /* Flush when approaching buffer limit */
-        if (pos > TCP_TX_BUF_SIZE - 32) {
-            tcp_send_locked(buf, pos);
-            pos = 0;
-        }
     }
 #else
     pos += snprintf(buf + pos, sizeof(buf) - pos,
@@ -387,25 +463,24 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
         info->len, info->first_word_invalid,
         (int16_t)(compensate_gain * info->buf[0]));
 
-    /* Flush header + first element */
-    tcp_send_locked(buf, pos);
-    pos = 0;
-
     for (int i = 1; i < info->len; i++) {
+        if (pos > TCP_TX_BUF_SIZE - 12) break;
         pos += snprintf(buf + pos, sizeof(buf) - pos,
             ",%d", (int16_t)(compensate_gain * info->buf[i]));
-        if (pos > TCP_TX_BUF_SIZE - 32) {
-            tcp_send_locked(buf, pos);
-            pos = 0;
-        }
     }
 #endif
 
     /* ── Close the array and row ── */
     pos += snprintf(buf + pos, sizeof(buf) - pos, "]\"\n");
-    tcp_send_locked(buf, pos);
 
-    xSemaphoreGive(s_tcp_mutex);
+    /* Non-blocking push to the writer task. If the stream buffer is full
+       (writer stalled / TCP back-pressured) we drop this frame rather
+       than stall the Wi-Fi task. Matches the overnight-capture contract:
+       "occasional dropped frames OK, disassoc not OK". */
+    size_t sent = xStreamBufferSend(s_tx_stream, buf, pos, 0);
+    if (sent != (size_t)pos) {
+        s_csi_frames_dropped++;
+    }
     s_count++;
 }
 
@@ -684,6 +759,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         wifi_config_t wifi_config = {0};
         memcpy(wifi_config.sta.ssid,     evt->ssid,     sizeof(wifi_config.sta.ssid));
         memcpy(wifi_config.sta.password, evt->password, sizeof(wifi_config.sta.password));
+        wifi_config.sta.listen_interval = 1;
         if (evt->bssid_set) {
             wifi_config.sta.bssid_set = true;
             memcpy(wifi_config.sta.bssid, evt->bssid, sizeof(wifi_config.sta.bssid));
@@ -726,6 +802,10 @@ static void wifi_init(void)
         wifi_config_t wifi_config = {0};
         memcpy(wifi_config.sta.ssid,     ssid,     sizeof(wifi_config.sta.ssid));
         memcpy(wifi_config.sta.password, password, sizeof(wifi_config.sta.password));
+        /* Advertise listen_interval=1 so AP treats STA as always-listening.
+           Default (CONFIG_ESP_WIFI_STA_LISTEN_INTERVAL=3) confuses some APs
+           even when PS is disabled, and they deprioritize us. */
+        wifi_config.sta.listen_interval = 1;
         ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
         s_has_stored_creds = true;
     } else {
@@ -733,6 +813,21 @@ static void wifi_init(void)
     }
 
     ESP_ERROR_CHECK(esp_wifi_start());
+
+    /* Disable Wi-Fi power save. The default WIFI_PS_MIN_MODEM sleeps between
+       beacons with listen_interval > 1, causing bcn_timeout / TBTT-delay
+       storms under a sustained 100 Hz CSI workload. A missed beacon marks
+       the link dead and send() returns EHOSTUNREACH (errno 113) until the
+       STA re-associates. Keep the radio fully on. */
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+
+    /* Extend the STA inactive time from the default 10 s to 30 s. This is
+       the beacon-loss watchdog: if no beacon is received within this many
+       seconds, the STA disassociates. With CSI at 50+ Hz the radio
+       occasionally misses a short run of beacons due to TX/RX contention;
+       the default triggers disassoc → EHOSTUNREACH on the TCP socket every
+       ~11 s. 30 s is the max permitted. */
+    ESP_ERROR_CHECK(esp_wifi_set_inactive_time(WIFI_IF_STA, 30));
 
     /* Block until we get an IP, or stored credentials are rejected as bad.
        WIFI_FAIL_BIT is now set ONLY after WIFI_AUTH_FAIL_THRESHOLD consecutive
@@ -768,6 +863,16 @@ void app_main(void)
     /* Create the mutex before the CSI callback can fire */
     s_tcp_mutex = xSemaphoreCreateMutex();
     configASSERT(s_tcp_mutex);
+
+    /* Stream buffer connecting wifi-task (producer) → writer task (consumer).
+       Must exist before CSI callback fires or frames are dropped silently. */
+    s_tx_stream = xStreamBufferCreate(CSI_STREAM_BUF_BYTES, 1);
+    configASSERT(s_tx_stream);
+
+    /* Writer task — drains the stream and performs the only blocking send()
+       in the system. Higher priority than reconnect task (must drain promptly)
+       but lower than Wi-Fi task so it can't starve beacon handling. */
+    xTaskCreate(tcp_writer_task, "tcp_writer", 4096, NULL, 5, NULL);
 
     /* Reconnect task — runs at low priority, wakes every 200 ms */
     xTaskCreate(tcp_reconnect_task, "tcp_reconnect", 4096, NULL, 3, NULL);

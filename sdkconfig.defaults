@@ -52,6 +52,16 @@ CONFIG_ESP32_WIFI_DYNAMIC_TX_BUFFER_NUM=32
 CONFIG_LWIP_TCP_KEEPALIVE=y
 
 #
+# More Wi-Fi management buffers so an AP probe / retransmit burst doesn't
+# stall the RX path.
+#
+CONFIG_ESP32_WIFI_MGMT_SBUF_NUM=32
+
+# Note: STA inactive-time (beacon-loss watchdog) and listen_interval are set
+# at runtime via esp_wifi_set_inactive_time() / wifi_config.sta.listen_interval
+# in main/app_main.c. They are not Kconfig-settable in IDF 6.0.
+
+#
 # ESP32S3-specific
 #
 CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240=y
