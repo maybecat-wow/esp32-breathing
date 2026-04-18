@@ -5,8 +5,26 @@
  */
 /* Get recv router csi — TCP output edition
 
-   CSI frames are sent as newline-terminated CSV over a persistent TCP
-   connection to a host running capture.py.
+   Architecture overview
+   ─────────────────────
+   Wi-Fi task (highest priority)
+     └─ wifi_csi_rx_cb()  ← called per beacon/ping by the Wi-Fi driver
+           │  builds one CSV row into a stack buffer (no mutex, no send)
+           └─ xStreamBufferSend()  ← non-blocking; drops frame if full
+                  │
+                  ▼  (StreamBuffer, 8 KB)
+   tcp_writer_task (priority 5)
+     └─ xStreamBufferReceive() → tcp_send_locked() → send()
+          (only task that ever blocks on TCP back-pressure)
+
+   tcp_reconnect_task (priority 3)
+     └─ maintains TCP socket, sends CSV header on (re-)connect,
+        emits 1 Hz heartbeat, logs CSI frame counters every 5 s
+
+   This two-task design keeps the Wi-Fi task free of TCP back-pressure.
+   If the network stalls, the 8 KB stream buffer absorbs ~10 rows; frames
+   beyond that are dropped (counted in s_csi_frames_dropped) rather than
+   blocking the Wi-Fi task and risking beacon loss.
 
    Menuconfig (idf.py menuconfig → CSI Breathing Monitor):
      CONFIG_CSI_TCP_HOST    — host IP of the capture machine
@@ -16,9 +34,11 @@
    Defaults are set in main/Kconfig.projbuild.
 
    Wi-Fi provisioning:
-     First boot: device enters ESPTouch mode. Use the Espressif EspTouch
-     phone app to send credentials. They are saved to NVS and reused on
-     subsequent boots.
+     First boot: device enters ESPTouch v1 (SmartConfig) mode.
+     Use the Espressif EspTouch app to push credentials. They are saved
+     to NVS and reused on subsequent boots. Credentials are NEVER erased
+     after the first successful association — transient AP glitches during
+     overnight captures will not trigger re-provisioning.
 */
 #include <stdio.h>
 #include <string.h>
@@ -66,8 +86,8 @@
 #define TCP_RECONNECT_BACKOFF_MIN_MS    500
 #define TCP_RECONNECT_BACKOFF_MAX_MS    30000
 
-/* Poll interval while the TCP connection is up (used to drive the 1 Hz
-   heartbeat when no CSI has been sent recently). */
+/* Poll interval while the TCP connection is up. The reconnect task wakes
+   at this rate to check whether a heartbeat is due and to log frame stats. */
 #define TCP_CONNECTED_POLL_MS           500
 
 /* Heartbeat line is emitted when this long has passed since the last send. */
@@ -79,8 +99,10 @@
 #define WIFI_RECONNECT_BACKOFF_MIN_MS   500
 #define WIFI_RECONNECT_BACKOFF_MAX_MS   30000
 
-/* Auth-class failures allowed *before first successful association only*
-   before NVS is erased and ESPTouch re-provisioning is triggered. */
+/* Auth-class failures (wrong password) allowed *before the first ever
+   successful association* before NVS is erased and ESPTouch is triggered.
+   After first successful assoc, NVS is never erased automatically — only
+   idf.py erase-flash can reset credentials. */
 #define WIFI_AUTH_FAIL_THRESHOLD        5
 
 #if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C61
