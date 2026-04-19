@@ -1699,7 +1699,7 @@ Examples:
     python csi_breathing.py CSI_DATA.txt
     python csi_breathing.py CSI_DATA.txt --output-dir results
     python csi_breathing.py CSI_DATA.txt --methods ratio amplitude phase
-    python csi_breathing.py night.csv --sliding --window 60 --stride 10
+    python csi_breathing.py night.csv --sliding --window 120 --stride 10
 
 Methods:
     ratio        - Cross-subcarrier ratio: conjugate product against a reference
@@ -1740,8 +1740,16 @@ References:
     parser.add_argument(
         "--window",
         type=float,
-        default=60.0,
-        help="Sliding window width in seconds (default: 60)",
+        default=120.0,
+        # 120 s is chosen so that even the slowest plausible adult breathing
+        # rate (6 BPM = 0.1 Hz) produces at least 12 full cycles inside the
+        # window.  12 cycles is the empirical minimum for PSD and
+        # autocorrelation estimators to converge reliably.  It also gives a
+        # spectral resolution of 1/120 ≈ 0.008 Hz ≈ 0.5 BPM, versus ~1 BPM
+        # at 60 s — a meaningful improvement for overnight sleep data where
+        # distinguishing 11 BPM from 12 BPM actually matters.
+        # The stride stays at 10 s, so temporal resolution is unaffected.
+        help="Sliding window width in seconds (default: 120)",
     )
     parser.add_argument(
         "--stride",
