@@ -67,9 +67,10 @@ ESP32 (app_main.c)
 
 - **`wifi_init()`** — initialises STA mode, registers event handlers, loads NVS credentials or falls back to ESPTouch (`smartconfig_task`), blocks until connected.
 - **`tcp_reconnect_task()`** — FreeRTOS task that maintains the outbound TCP connection; reconnects automatically when it drops. Guards `s_tcp_sock` with `s_tcp_mutex`.
-- **`wifi_csi_rx_cb()`** — CSI callback registered via `esp_wifi_set_csi_rx_cb()`. Filters frames by the AP's BSSID, applies gain compensation (`esp_csi_gain_ctrl`), and emits a `SESSION_INFO` message once per TCP (re)connect followed by one `CSI_FRAME` message per captured frame. Buffer management flushes before `TCP_TX_BUF_SIZE - 32` bytes to avoid overflow.
+- **`wifi_csi_rx_cb()`** — CSI callback registered via `esp_wifi_set_csi_rx_cb()`. Filters frames by the AP's BSSID, builds a binary `CSI_FRAME` message (header + meta + raw CSI bytes) into a stack buffer, and enqueues it atomically via `xStreamBufferSend` for the writer task. No `snprintf`, no logging on the success path.
+- **`tcp_send_session_info_locked()`** — emits one `SESSION_INFO` message per (re)connect from the reconnect task while holding `s_tcp_mutex`. Establishes `boot_id` so the host can tell a TCP reconnect from an ESP32 reboot.
+- **`tcp_send_heartbeat_locked()`** — emits a binary `HEARTBEAT` at 1 Hz when no CSI has gone out for ≥1 s.
 - **`wifi_ping_router_start()`** — starts a continuous ping to the gateway at `CONFIG_SEND_FREQUENCY` (100) Hz, which is the traffic source that generates CSI frames.
-- Gain control is enabled on ESP32-S3 (and other supported gain-library targets); the first 100 frames are used to establish a gain baseline.
 
 ### Wire format
 
@@ -88,10 +89,11 @@ old CSV `data` array.
 
 ### Host capture (`capture.py`)
 
-Single-connection TCP server. On each new connection it:
-1. Reads the next `SESSION_INFO` message and logs the firmware build / session metadata.
-2. Appends raw framed bytes (`type | length | payload`) to the output `.bin` file as they arrive, so the file remains a valid concatenation of binary messages across reconnects.
-3. `CSI_FRAME` messages are validated by `csi_protocol.decode_*` (length, declared vs actual payload size) before being written; malformed or non-CSI traffic goes to the log file.
+Single-connection TCP server. Acts as a near-dumb byte-pipe:
+1. Reads each message's 3-byte header, then exactly `length` payload bytes. The first message MUST be `SESSION_INFO` or the socket is closed and logged.
+2. Appends raw framed bytes (`type | length | payload`) verbatim to the output `.bin` file. The file on disk is byte-identical to the wire, so a capture can be replayed by feeding it back to `csi_breathing.load_binary`.
+3. Peeks each message's meta via `csi_protocol.decode_*` to update `stats.json` (`frames_written`, `gap_count`, `total_gap_seconds`, etc.) — the raw CSI payload bytes are never parsed by capture.py itself.
+4. `MAX_PAYLOAD_BYTES` cap (4096) closes the socket on any oversized length field; protocol-level offenses go to the sidecar log file.
 
 ### Analysis (`csi_breathing.py`)
 
@@ -106,6 +108,5 @@ Key constants at the top of the file control the breathing frequency band (defau
 
 Declared in `main/idf_component.yml`:
 - `idf >= 4.4.1`
-- `esp_csi_gain_ctrl >= 0.1.4` (from the IDF Component Registry)
 
 `sdkconfig.defaults` sets: CSI enabled, 240 MHz CPU, 1000 Hz FreeRTOS tick, performance compiler optimisation, 921600 baud UART, 32/128 TX/RX Wi-Fi buffers.
