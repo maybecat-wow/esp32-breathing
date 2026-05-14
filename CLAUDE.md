@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This project uses Wi-Fi Channel State Information (CSI) from an ESP32 to detect breathing rates. The ESP32 firmware pings the router at 100 Hz, captures the resulting CSI frames, and streams them as CSV over a persistent TCP connection to a host machine. The host saves frames to a CSV file, which is then processed offline to extract breathing rate estimates.
+This project uses Wi-Fi Channel State Information (CSI) from an ESP32 to detect breathing rates. The ESP32 firmware pings the router at 100 Hz, captures the resulting CSI frames, and streams them as length-prefixed binary messages over a persistent TCP connection to a host machine. The host saves frames to a binary capture file, which is then processed offline to extract breathing rate estimates.
 
 ## Development Workflow
 
@@ -31,15 +31,17 @@ idf.py build flash monitor
 
 Start the TCP server (listens on port 3490 by default):
 ```sh
-python capture.py -s csi_data.csv
-python capture.py -s csi_data.csv -p 3490 -l csi_data_log.txt
+python capture.py -s csi_data.bin
+python capture.py -s csi_data.bin -p 3490 -l csi_data_log.txt
 ```
+
+Captures are written as `.bin` files (length-prefixed binary protocol) and can be replayed in Python via `csi_breathing.load_binary(path)`.
 
 ### Offline analysis
 
 ```sh
 pip install numpy scipy matplotlib PyWavelets
-python csi_breathing.py csi_data.csv --output-dir results
+python csi_breathing.py csi_data.bin --output-dir results
 ```
 
 ## Configuration Before Use
@@ -57,35 +59,41 @@ Two settings **must** be changed before flashing:
 ```
 ESP32 (app_main.c)
   └─ pings router at 100 Hz  →  CSI frames via wifi_csi_rx_cb()
-       └─ formatted as CSV  →  TCP stream to capture.py
-            └─ csi_data.csv  →  csi_breathing.py  →  breathing rate plot
+       └─ packed as binary messages  →  TCP stream to capture.py
+            └─ csi_data.bin  →  csi_breathing.py  →  breathing rate plot
 ```
 
 ### Firmware (`main/app_main.c`)
 
 - **`wifi_init()`** — initialises STA mode, registers event handlers, loads NVS credentials or falls back to ESPTouch (`smartconfig_task`), blocks until connected.
 - **`tcp_reconnect_task()`** — FreeRTOS task that maintains the outbound TCP connection; reconnects automatically when it drops. Guards `s_tcp_sock` with `s_tcp_mutex`.
-- **`wifi_csi_rx_cb()`** — CSI callback registered via `esp_wifi_set_csi_rx_cb()`. Filters frames by the AP's BSSID, applies gain compensation (`esp_csi_gain_ctrl`), and sends a CSV header once per connection followed by one data row per frame. Buffer management flushes before `TCP_TX_BUF_SIZE - 32` bytes to avoid overflow.
+- **`wifi_csi_rx_cb()`** — CSI callback registered via `esp_wifi_set_csi_rx_cb()`. Filters frames by the AP's BSSID, builds a binary `CSI_FRAME` message (header + meta + raw CSI bytes) into a stack buffer, and enqueues it atomically via `xStreamBufferSend` for the writer task. No `snprintf`, no logging on the success path.
+- **`tcp_send_session_info_locked()`** — emits one `SESSION_INFO` message per (re)connect from the reconnect task while holding `s_tcp_mutex`. Establishes `boot_id` so the host can tell a TCP reconnect from an ESP32 reboot.
+- **`tcp_send_heartbeat_locked()`** — emits a binary `HEARTBEAT` at 1 Hz when no CSI has gone out for ≥1 s.
 - **`wifi_ping_router_start()`** — starts a continuous ping to the gateway at `CONFIG_SEND_FREQUENCY` (100) Hz, which is the traffic source that generates CSI frames.
-- Gain control is enabled on C3/C5/C6/C61/S3 targets only; the first 100 frames are used to establish a gain baseline.
 
-### CSV format
+### Wire format
 
-The ESP32 sends the header on each new TCP connection. Two layouts exist depending on the target chip:
+The ESP32 streams a sequence of length-prefixed binary messages
+(little-endian, `u8 type | u16 length | payload`). Three message types:
+SESSION_INFO (sent once per TCP (re)connect), CSI_FRAME (one per CSI
+capture), HEARTBEAT (1 Hz idle). The wire format is defined in
+`csi_protocol.py` and `main/csi_protocol.h`; the two MUST stay in sync —
+the Python side pins struct sizes via unit tests, and the firmware side
+pins them via `_Static_assert`.
 
-| Target | Columns |
-|--------|---------|
-| ESP32 / S3 / C3 | 25 columns: type, id, mac, rssi, rate, sig_mode, mcs, bandwidth, smoothing, not_sounding, aggregation, stbc, fec_coding, sgi, noise_floor, ampdu_cnt, channel, secondary_channel, local_timestamp, ant, sig_len, rx_state, len, first_word, data |
-| C5 / C6 / C61 | 15 columns (no HT/VHT fields) |
-
-The `data` field is a JSON array of signed 16-bit integers — 128 bytes = 64 complex subcarriers stored as `[imag, real, imag, real, …]` pairs.
+Supported chips: classic ESP32 and ESP32-S3, LLTF-only (lltf_en=true,
+htltf_en=false), 64 subcarriers × I/Q = 128 CSI bytes per frame.
+Each CSI byte pair is (imag, real) signed int8 — same byte order as the
+old CSV `data` array.
 
 ### Host capture (`capture.py`)
 
-Single-connection TCP server. On each new connection it:
-1. Reads and validates the CSV header (must match one of the two known column counts).
-2. Writes the header to the output file once (subsequent reconnections skip it so the CSV stays valid for append).
-3. Streams rows: non-CSI lines go to the log file; CSI rows are validated (column count, JSON completeness, declared vs actual length) before being written.
+Single-connection TCP server. Acts as a near-dumb byte-pipe:
+1. Reads each message's 3-byte header, then exactly `length` payload bytes. The first message MUST be `SESSION_INFO` or the socket is closed and logged.
+2. Appends raw framed bytes (`type | length | payload`) verbatim to the output `.bin` file. The file on disk is byte-identical to the wire, so a capture can be replayed by feeding it back to `csi_breathing.load_binary`.
+3. Peeks each message's meta via `csi_protocol.decode_*` to update `stats.json` (`frames_written`, `gap_count`, `total_gap_seconds`, etc.) — the raw CSI payload bytes are never parsed by capture.py itself.
+4. `MAX_PAYLOAD_BYTES` cap (4096) closes the socket on any oversized length field; protocol-level offenses go to the sidecar log file.
 
 ### Analysis (`csi_breathing.py`)
 
@@ -100,6 +108,5 @@ Key constants at the top of the file control the breathing frequency band (defau
 
 Declared in `main/idf_component.yml`:
 - `idf >= 4.4.1`
-- `esp_csi_gain_ctrl >= 0.1.4` (from the IDF Component Registry)
 
 `sdkconfig.defaults` sets: CSI enabled, 240 MHz CPU, 1000 Hz FreeRTOS tick, performance compiler optimisation, 921600 baud UART, 32/128 TX/RX Wi-Fi buffers.

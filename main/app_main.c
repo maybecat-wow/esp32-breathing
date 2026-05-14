@@ -3,13 +3,14 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  */
-/* Get recv router csi — TCP output edition
+/* Get recv router csi — TCP binary output edition
 
    Architecture overview
    ─────────────────────
    Wi-Fi task (highest priority)
      └─ wifi_csi_rx_cb()  ← called per beacon/ping by the Wi-Fi driver
-           │  builds one CSV row into a stack buffer (no mutex, no send)
+           │  builds one binary CSI_FRAME message into a stack buffer
+           │  (no mutex, no send)
            └─ xStreamBufferSend()  ← non-blocking; drops frame if full
                   │
                   ▼  (StreamBuffer, 8 KB)
@@ -18,13 +19,15 @@
           (only task that ever blocks on TCP back-pressure)
 
    tcp_reconnect_task (priority 3)
-     └─ maintains TCP socket, sends CSV header on (re-)connect,
-        emits 1 Hz heartbeat, logs CSI frame counters every 5 s
+     └─ maintains TCP socket, sends SESSION_INFO on (re-)connect,
+        emits 1 Hz binary HEARTBEAT, logs CSI frame counters every 5 s
 
+   Wire protocol (see csi_protocol.h) is binary: every message is a
+   3-byte header (type, u16 length) followed by `length` payload bytes.
    This two-task design keeps the Wi-Fi task free of TCP back-pressure.
-   If the network stalls, the 8 KB stream buffer absorbs ~10 rows; frames
-   beyond that are dropped (counted in s_csi_frames_dropped) rather than
-   blocking the Wi-Fi task and risking beacon loss.
+   The 8 KB stream buffer absorbs ~57 binary frames during a short
+   network stall; frames beyond that are dropped (s_csi_frames_dropped)
+   rather than blocking the Wi-Fi task and risking beacon loss.
 
    Menuconfig (idf.py menuconfig → CSI Breathing Monitor):
      CONFIG_CSI_TCP_HOST    — host IP of the capture machine
@@ -68,7 +71,9 @@
 #include "lwip/err.h"
 #include "ping/ping_sock.h"
 
-#include "esp_csi_gain_ctrl.h"
+#include "esp_random.h"
+
+#include "csi_protocol.h"
 
 /* ── Configuration ──────────────────────────────────────────────────────── */
 
@@ -76,9 +81,10 @@
  * provided by Kconfig (main/Kconfig.projbuild) and configurable via
  * idf.py menuconfig under "CSI Breathing Monitor". */
 
-/* How large a single CSV line can be.
-   Worst case: header (~120 B) + 128 CSI bytes as "%d," (~640 B) + overhead */
-#define TCP_TX_BUF_SIZE         1024
+/* Chunk size for the writer task's receive buffer. The producer side emits
+   one full binary message per xStreamBufferSend, so small fixed chunks are
+   fine — we never fragment a logical message across sends. */
+#define TCP_TX_BUF_SIZE         256
 
 /* Exponential backoff for TCP reconnection (milliseconds). Starts at
    TCP_RECONNECT_BACKOFF_MIN_MS after a failure, doubles on each failure, caps
@@ -105,29 +111,21 @@
    idf.py erase-flash can reset credentials. */
 #define WIFI_AUTH_FAIL_THRESHOLD        5
 
-#if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C61
-#define CSI_FORCE_LLTF          0
-#endif
-
-#define CONFIG_FORCE_GAIN       0
-
-#if CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32C3 || \
-    CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6  || \
-    CONFIG_IDF_TARGET_ESP32C61
-#define CONFIG_GAIN_CONTROL     1
-#endif
-
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)
 #define ESP_IF_WIFI_STA ESP_MAC_WIFI_STA
 #endif
 
 static const char *TAG = "csi_recv_router";
 
+/* Captured once at boot; lets the host distinguish "ESP32 rebooted"
+   (different boot_id) from "TCP reconnect" (same boot_id). */
+static uint32_t s_boot_id = 0;
+
 /* ── TCP + Wi-Fi state ──────────────────────────────────────────────────── */
 
 static int          s_tcp_sock   = -1;          /* socket fd, -1 = disconnected */
 static SemaphoreHandle_t s_tcp_mutex = NULL;    /* guards all fields below      */
-static bool         s_header_sent = false;      /* have we sent the CSV header?  */
+static bool         s_session_info_sent = false;      /* have we sent SESSION_INFO?    */
 static int64_t      s_last_tx_us  = 0;          /* esp_timer_get_time() of last successful send */
 
 /* Observability fields for the periodic heartbeat line. Updated from the
@@ -142,9 +140,9 @@ static volatile uint32_t s_csi_frames_accepted = 0;  /* passed BSSID filter */
 static volatile uint32_t s_csi_frames_dropped  = 0;  /* stream buffer full  */
 
 /* Byte stream buffer connecting the CSI callback (producer) to the writer
-   task (consumer). Sized to hold ~10 full CSV rows so short network stalls
-   don't drop frames while still bounding RAM. A blocking send() now only
-   ever stalls the writer task, never the Wi-Fi task. */
+   task (consumer). Sized to hold ~57 full binary CSI_FRAME messages so
+   short network stalls don't drop frames while still bounding RAM. A
+   blocking send() now only ever stalls the writer task, never Wi-Fi. */
 #define CSI_STREAM_BUF_BYTES   8192
 static StreamBufferHandle_t s_tx_stream = NULL;
 
@@ -218,7 +216,7 @@ static void tcp_send_locked(const char *buf, int len)
             ESP_LOGW(TAG, "send() failed (errno %d) — closing socket", errno);
             close(s_tcp_sock);
             s_tcp_sock    = -1;
-            s_header_sent = false;
+            s_session_info_sent = false;
             return;
         }
         sent += n;
@@ -228,27 +226,47 @@ static void tcp_send_locked(const char *buf, int len)
 }
 
 /**
- * Write the CSV header. Must be called with s_tcp_mutex held.
- * Idempotent: no-op if already sent on this socket.
+ * Build and send a SESSION_INFO message. Called from tcp_reconnect_task on
+ * each successful connect. Must be called with s_tcp_mutex held.
  */
-static void tcp_send_header_locked(void)
+static void tcp_send_session_info_locked(void)
 {
-    if (s_tcp_sock < 0 || s_header_sent) return;
-    char buf[TCP_TX_BUF_SIZE];
-    int pos;
-#if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32C61
-    pos = snprintf(buf, sizeof(buf),
-        "type,id,mac,rssi,rate,noise_floor,fft_gain,agc_gain,"
-        "channel,local_timestamp,sig_len,rx_state,len,first_word,data\n");
+    if (s_tcp_sock < 0 || s_session_info_sent) return;
+
+    wifi_ap_record_t ap = {0};
+    uint8_t channel = 0;
+    uint8_t mac[6] = {0};
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+        channel = ap.primary;
+    }
+    esp_wifi_get_mac(WIFI_IF_STA, mac);
+
+#if CONFIG_IDF_TARGET_ESP32S3
+    const uint8_t chip_id = 2;
 #else
-    pos = snprintf(buf, sizeof(buf),
-        "type,id,mac,rssi,rate,sig_mode,mcs,bandwidth,smoothing,"
-        "not_sounding,aggregation,stbc,fec_coding,sgi,noise_floor,"
-        "ampdu_cnt,channel,secondary_channel,local_timestamp,ant,"
-        "sig_len,rx_state,len,first_word,data\n");
+    const uint8_t chip_id = 1;
 #endif
-    tcp_send_locked(buf, pos);
-    s_header_sent = true;
+
+    uint8_t buf[sizeof(csi_msg_header_t) + sizeof(csi_session_info_t)];
+    csi_msg_header_t *hdr = (csi_msg_header_t *)buf;
+    csi_session_info_t *info =
+        (csi_session_info_t *)(buf + sizeof(csi_msg_header_t));
+
+    hdr->type   = MSG_SESSION_INFO;
+    hdr->length = sizeof(csi_session_info_t);
+
+    info->chip_id        = chip_id;
+    info->csi_format     = 0;  /* legacy HT LLTF */
+    info->csi_bytes      = 128;
+    memcpy(info->mac, mac, 6);
+    info->channel        = channel;
+    info->reserved       = 0;
+    info->sample_rate_hz = (uint16_t)CONFIG_SEND_FREQUENCY;
+    info->boot_id        = s_boot_id;
+    info->esp_time_us    = (uint64_t)esp_timer_get_time();
+
+    tcp_send_locked((const char *)buf, sizeof(buf));
+    s_session_info_sent = true;
 }
 
 /**
@@ -259,25 +277,33 @@ static void tcp_send_header_locked(void)
  */
 static void tcp_send_heartbeat_locked(void)
 {
-    if (s_tcp_sock < 0 || !s_header_sent) return;
+    if (s_tcp_sock < 0 || !s_session_info_sent) return;
 
     wifi_ap_record_t ap = {0};
-    int rssi = 0;
-    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) rssi = ap.rssi;
-
-    int64_t now_us    = esp_timer_get_time();
+    int8_t rssi = 0;
+    uint8_t channel = 0;
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+        rssi = (int8_t)ap.rssi;
+        channel = ap.primary;
+    }
+    int64_t now_us = esp_timer_get_time();
     uint32_t uptime_s = (uint32_t)(now_us / 1000000);
 
-    char line[96];
-    int pos = snprintf(line, sizeof(line),
-        "HEARTBEAT,%lld,%d,%lu,%lu,%d\n",
-        (long long)now_us, rssi,
-        (unsigned long)uptime_s,
-        (unsigned long)s_reconnect_count,
-        s_last_disc_reason);
-    if (pos > 0 && pos < (int)sizeof(line)) {
-        tcp_send_locked(line, pos);
-    }
+    uint8_t buf[sizeof(csi_msg_header_t) + sizeof(csi_heartbeat_t)];
+    csi_msg_header_t *hdr = (csi_msg_header_t *)buf;
+    csi_heartbeat_t  *hb  = (csi_heartbeat_t *)(buf + sizeof(csi_msg_header_t));
+
+    hdr->type   = MSG_HEARTBEAT;
+    hdr->length = sizeof(csi_heartbeat_t);
+
+    hb->esp_time_us      = (uint64_t)now_us;
+    hb->rssi             = rssi;
+    hb->channel          = channel;
+    hb->uptime_s         = uptime_s;
+    hb->reconnect_count  = s_reconnect_count;
+    hb->last_disc_reason = (uint8_t)s_last_disc_reason;
+
+    tcp_send_locked((const char *)buf, sizeof(buf));
 }
 
 /**
@@ -295,10 +321,10 @@ static void tcp_writer_task(void *arg)
         if (n == 0) continue;
 
         xSemaphoreTake(s_tcp_mutex, portMAX_DELAY);
-        /* Header is sent on connect from tcp_reconnect_task, so by the time
-           we have data the socket is either healthy or the reconnect task
-           is currently bringing it back up. In the latter case, drop. */
-        if (s_tcp_sock >= 0 && s_header_sent) {
+        /* SESSION_INFO is sent on connect from tcp_reconnect_task, so by the
+           time we have data the socket is either healthy or the reconnect
+           task is currently bringing it back up. In the latter case, drop. */
+        if (s_tcp_sock >= 0 && s_session_info_sent) {
             tcp_send_locked(buf, (int)n);
         }
         xSemaphoreGive(s_tcp_mutex);
@@ -352,14 +378,14 @@ static void tcp_reconnect_task(void *arg)
             int sock = tcp_connect();
             xSemaphoreTake(s_tcp_mutex, portMAX_DELAY);
             s_tcp_sock    = sock;
-            s_header_sent = false;   /* re-send header on new connection */
+            s_session_info_sent = false;   /* re-send SESSION_INFO on new connection */
             if (sock >= 0) {
                 s_last_tx_us = esp_timer_get_time();
-                /* Send header immediately so capture.py's recv timeout can't
-                   fire before the first CSI frame arrives (which may be never
-                   if ping is blocked). After this, heartbeats keep the link
-                   alive and diagnosable even with zero CSI. */
-                tcp_send_header_locked();
+                /* Send SESSION_INFO immediately so capture.py's recv timeout
+                   can't fire before the first CSI frame arrives (which may
+                   be never if ping is blocked). After this, heartbeats keep
+                   the link alive and diagnosable even with zero CSI. */
+                tcp_send_session_info_locked();
             }
             xSemaphoreGive(s_tcp_mutex);
 
@@ -398,151 +424,58 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
 
     s_csi_frames_total++;
 
+    /* Filter by AP BSSID — only frames from our router. */
     if (memcmp(info->mac, ctx, 6)) {
         return;
     }
 
     s_csi_frames_accepted++;
 
-    /* Drop frame if no stream buffer (early boot) or not yet connected.
-       Checking s_tcp_sock is a plain int read — worst case we build a
-       line and push it to the queue, the writer task sees sock<0 and
-       discards on dequeue. We never take s_tcp_mutex here — the whole
-       point of the queue is to keep the Wi-Fi task off that lock. */
     if (s_tx_stream == NULL) return;
 
     const wifi_pkt_rx_ctrl_t *rx_ctrl = &info->rx_ctrl;
-    static int s_count = 0;
-    float compensate_gain = 1.0f;
-    static uint8_t agc_gain = 0;
-    static int8_t  fft_gain = 0;
+    static uint32_t s_seq = 0;
 
-#if CONFIG_GAIN_CONTROL
-    static uint8_t agc_gain_baseline = 0;
-    static int8_t  fft_gain_baseline = 0;
-    esp_csi_gain_ctrl_get_rx_gain(rx_ctrl, &agc_gain, &fft_gain);
-    if (s_count < 100) {
-        esp_csi_gain_ctrl_record_rx_gain(agc_gain, fft_gain);
-    } else if (s_count == 100) {
-        esp_csi_gain_ctrl_get_rx_gain_baseline(&agc_gain_baseline, &fft_gain_baseline);
-#if CONFIG_FORCE_GAIN
-        esp_csi_gain_ctrl_set_rx_force_gain(agc_gain_baseline, fft_gain_baseline);
-        ESP_LOGI(TAG, "fft_force %d, agc_force %d", fft_gain_baseline, agc_gain_baseline);
-#endif
+    /* Cap CSI byte count at a sane size; LLTF gives 128 bytes. Anything
+       wildly different is hardware glitch territory. */
+    int csi_len = info->len;
+    if (csi_len < 0 || csi_len > 256) {
+        ESP_LOGW(TAG, "unexpected CSI len=%d — dropping frame", info->len);
+        return;
     }
-    esp_csi_gain_ctrl_get_gain_compensation(&compensate_gain, agc_gain, fft_gain);
-    ESP_LOGD(TAG, "compensate_gain %f, agc_gain %d, fft_gain %d",
-             compensate_gain, agc_gain, fft_gain);
-#endif
 
-    /* Build the CSV line into a stack buffer. The whole line is built
-       entirely before we touch the stream buffer — so we only enqueue
-       once per frame, atomically, and the consumer never sees a torn
-       row even under back-pressure. */
-    char buf[TCP_TX_BUF_SIZE];
-    int  pos = 0;
+    /* Build the entire message in one stack buffer so we enqueue atomically. */
+    uint8_t buf[sizeof(csi_msg_header_t) + sizeof(csi_frame_meta_t) + 256];
+    csi_msg_header_t *hdr = (csi_msg_header_t *)buf;
+    csi_frame_meta_t *meta =
+        (csi_frame_meta_t *)(buf + sizeof(csi_msg_header_t));
+    uint8_t *csi_dst =
+        buf + sizeof(csi_msg_header_t) + sizeof(csi_frame_meta_t);
 
-    /* ── CSI_DATA row — metadata fields ── */
-#if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32C61
-    pos += snprintf(buf + pos, sizeof(buf) - pos,
-        "CSI_DATA,%d," MACSTR ",%d,%d,%d,%d,%d,%d,%d,%d,%d",
-        s_count, MAC2STR(info->mac),
-        rx_ctrl->rssi, rx_ctrl->rate,
-        rx_ctrl->noise_floor, fft_gain, agc_gain,
-        rx_ctrl->channel, rx_ctrl->timestamp,
-        rx_ctrl->sig_len, rx_ctrl->rx_state);
-#else
-    pos += snprintf(buf + pos, sizeof(buf) - pos,
-        "CSI_DATA,%d," MACSTR ",%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
-        s_count, MAC2STR(info->mac),
-        rx_ctrl->rssi, rx_ctrl->rate, rx_ctrl->sig_mode,
-        rx_ctrl->mcs, rx_ctrl->cwb, rx_ctrl->smoothing,
-        rx_ctrl->not_sounding, rx_ctrl->aggregation,
-        rx_ctrl->stbc, rx_ctrl->fec_coding, rx_ctrl->sgi,
-        rx_ctrl->noise_floor, rx_ctrl->ampdu_cnt,
-        rx_ctrl->channel, rx_ctrl->secondary_channel,
-        rx_ctrl->timestamp, rx_ctrl->ant,
-        rx_ctrl->sig_len, rx_ctrl->rx_state);
-#endif
+    hdr->type   = MSG_CSI_FRAME;
+    hdr->length = sizeof(csi_frame_meta_t) + csi_len;
 
-    /* ── CSI data array ── */
-#if (CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C61) && CSI_FORCE_LLTF
-    int16_t csi_val = (int16_t)(((((uint16_t)info->buf[1]) << 8) | info->buf[0]) << 4) >> 4;
-    pos += snprintf(buf + pos, sizeof(buf) - pos,
-        ",%d,%d,\"[%d",
-        (info->len - 2) / 2, info->first_word_invalid,
-        (int16_t)(compensate_gain * csi_val));
+    meta->local_timestamp_us = (uint32_t)rx_ctrl->timestamp;
+    meta->seq                = s_seq++;
+    meta->rssi               = (int8_t)rx_ctrl->rssi;
+    meta->noise_floor        = (int8_t)rx_ctrl->noise_floor;
+    meta->rate               = (uint8_t)rx_ctrl->rate;
+    meta->first_word_invalid = (uint8_t)info->first_word_invalid;
+    meta->len                = (uint16_t)csi_len;
 
-    for (int i = 2; i < (info->len - 2); i += 2) {
-        if (pos > TCP_TX_BUF_SIZE - 12) break;   /* drop rest of row if line would overflow */
-        csi_val = (int16_t)(((((uint16_t)info->buf[i+1]) << 8) | info->buf[i]) << 4) >> 4;
-        pos += snprintf(buf + pos, sizeof(buf) - pos,
-            ",%d", (int16_t)(compensate_gain * csi_val));
-    }
-#else
-    pos += snprintf(buf + pos, sizeof(buf) - pos,
-        ",%d,%d,\"[%d",
-        info->len, info->first_word_invalid,
-        (int16_t)(compensate_gain * info->buf[0]));
+    memcpy(csi_dst, info->buf, csi_len);
 
-    for (int i = 1; i < info->len; i++) {
-        if (pos > TCP_TX_BUF_SIZE - 12) break;
-        pos += snprintf(buf + pos, sizeof(buf) - pos,
-            ",%d", (int16_t)(compensate_gain * info->buf[i]));
-    }
-#endif
-
-    /* ── Close the array and row ── */
-    pos += snprintf(buf + pos, sizeof(buf) - pos, "]\"\n");
-
-    /* Non-blocking push to the writer task. If the stream buffer is full
-       (writer stalled / TCP back-pressured) we drop this frame rather
-       than stall the Wi-Fi task. Matches the overnight-capture contract:
-       "occasional dropped frames OK, disassoc not OK". */
-    size_t sent = xStreamBufferSend(s_tx_stream, buf, pos, 0);
-    if (sent != (size_t)pos) {
+    size_t total = sizeof(csi_msg_header_t) + sizeof(csi_frame_meta_t) + csi_len;
+    size_t sent = xStreamBufferSend(s_tx_stream, buf, total, 0);
+    if (sent != total) {
         s_csi_frames_dropped++;
     }
-    s_count++;
 }
 
 /* ── Wi-Fi CSI init ──────────────────────────────────────────────────────── */
 
 static void wifi_csi_init(void)
 {
-#if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C61
-    wifi_csi_config_t csi_config = {
-        .enable                   = true,
-        .acquire_csi_legacy       = true,
-        .acquire_csi_force_lltf   = CSI_FORCE_LLTF,
-        .acquire_csi_ht20         = true,
-        .acquire_csi_ht40         = true,
-        .acquire_csi_vht          = false,
-        .acquire_csi_su           = false,
-        .acquire_csi_mu           = false,
-        .acquire_csi_dcm          = false,
-        .acquire_csi_beamformed   = false,
-        .acquire_csi_he_stbc_mode = 2,
-        .val_scale_cfg            = 0,
-        .dump_ack_en              = false,
-        .reserved                 = false
-    };
-#elif CONFIG_IDF_TARGET_ESP32C6
-    wifi_csi_config_t csi_config = {
-        .enable                 = true,
-        .acquire_csi_legacy     = true,
-        .acquire_csi_ht20       = true,
-        .acquire_csi_ht40       = true,
-        .acquire_csi_su         = false,
-        .acquire_csi_mu         = false,
-        .acquire_csi_dcm        = false,
-        .acquire_csi_beamformed = false,
-        .acquire_csi_he_stbc    = 2,
-        .val_scale_cfg          = false,
-        .dump_ack_en            = false,
-        .reserved               = false
-    };
-#else
     wifi_csi_config_t csi_config = {
         .lltf_en           = true,
         .htltf_en          = false,
@@ -552,7 +485,6 @@ static void wifi_csi_init(void)
         .manu_scale        = true,
         .shift             = true,
     };
-#endif
 
     static wifi_ap_record_t s_ap_info = {0};
     ESP_ERROR_CHECK(esp_wifi_sta_get_ap_info(&s_ap_info));
@@ -876,6 +808,8 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+
+    s_boot_id = esp_random();
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());

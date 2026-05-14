@@ -9,26 +9,29 @@ The firmware pings the router at 100 Hz and captures the resulting CSI frames, w
 ```
 Wi-Fi task (highest priority)
   └─ wifi_csi_rx_cb()    ← called per ping by the Wi-Fi driver
-        │  builds one CSV row into a stack buffer (no mutex, no send)
+        │  builds one binary CSI_FRAME message into a stack buffer
+        │  (no mutex, no send, no snprintf)
         └─ xStreamBufferSend()  ← non-blocking; drops frame if buffer full
                │
-               ▼  StreamBuffer (8 KB, ~10 rows)
+               ▼  StreamBuffer (8 KB, ~57 frames)
 tcp_writer_task (priority 5)
   └─ xStreamBufferReceive() → send()
        (only place a blocking send() can occur)
 
 tcp_reconnect_task (priority 3)
-  └─ reconnects on drop, sends CSV header, emits 1 Hz heartbeat,
-     logs CSI frame counters (total / accepted / dropped) every 5 s
+  └─ reconnects on drop, sends SESSION_INFO once per connect,
+     emits 1 Hz binary HEARTBEAT, logs CSI frame counters every 5 s
 ```
 
-The Wi-Fi task never touches the TCP socket directly. If the network stalls, the stream buffer absorbs short bursts; frames beyond ~10 rows are dropped (counted) rather than blocking the Wi-Fi task and risking beacon loss.
+The Wi-Fi task never touches the TCP socket directly. If the network stalls, the stream buffer absorbs short bursts; frames beyond ~57 are dropped (counted) rather than blocking the Wi-Fi task and risking beacon loss.
 
 ### Host pipeline
 
 ```
-capture.py  ──► csi_data.csv  ──► csi_breathing.py  ──► BPM + plots
+capture.py  ──► csi_data.bin  ──► csi_breathing.py  ──► BPM + plots
 ```
+
+`csi_data.bin` is byte-identical to the wire — the host is a near-dumb pipe that writes every received message verbatim and peeks the headers for `stats.json`. Captures can be replayed by feeding the `.bin` back into `csi_breathing.load_binary(path)`.
 
 ---
 
@@ -36,14 +39,13 @@ capture.py  ──► csi_data.csv  ──► csi_breathing.py  ──► BPM + 
 
 ### Hardware
 
-- Any ESP32-family board with Wi-Fi: ESP32, ESP32-S3, ESP32-C3, ESP32-C5, ESP32-C6, or ESP32-C61
+- ESP32 (classic) or ESP32-S3 — LLTF-only CSI (64 subcarriers × I/Q, 128 bytes per frame)
 - A 2.4 GHz Wi-Fi access point (the router the ESP32 pings)
 - A host machine (Linux/macOS/Windows) on the same network
 
 ### Firmware
 
 - [ESP-IDF v6.0](https://docs.espressif.com/projects/esp-idf/en/v6.0/esp32/get-started/) (activate with `source ~/.espressif/tools/activate_idf_v6.0.sh`)
-- IDF Component: `esp_csi_gain_ctrl >= 0.1.4` (fetched automatically by the component manager)
 
 ### Host / Python
 
@@ -94,20 +96,20 @@ Credentials are only erased automatically if the device fails to authenticate **
 On your host machine, before or just after the ESP32 boots:
 
 ```sh
-python capture.py -s csi_data.csv
+python capture.py -s csi_data.bin
 # optional flags:
 #   -p 3490          TCP port (default 3490)
-#   -l capture.log   log file for invalid rows (default csi_data_log.txt)
+#   -l capture.log   sidecar log file for protocol errors (default csi_data_log.txt)
 ```
 
-The server listens on `0.0.0.0:<port>`, accepts the ESP32 connection, and appends validated CSI rows to `csi_data.csv`. When the connection drops (e.g. device reset) it waits for the next reconnection automatically.
+The server listens on `0.0.0.0:<port>`, accepts the ESP32 connection, and appends every binary message verbatim to `csi_data.bin`. Message headers are peeked to update a `csi_data.bin.stats.json` sidecar (frame count, gap profile, last heartbeat). When the connection drops it waits for the next reconnection automatically.
 
 Collect at least **30 seconds** of data (~3000 frames at 100 Hz) for reliable breathing rate estimation. More is better — 60–120 s is typical for a clean measurement.
 
 ### 5. Run the analysis
 
 ```sh
-python csi_breathing.py csi_data.csv --output-dir results
+python csi_breathing.py csi_data.bin --output-dir results
 ```
 
 Eight PNG plots are saved to `results/`. Breathing rate estimates from three independent methods are printed to stdout.
@@ -165,28 +167,32 @@ Results from all three estimators are printed side-by-side so you can cross-chec
 
 ---
 
-## CSV Format
+## Wire Format
 
-The ESP32 sends a CSV header row on every new TCP connection. Two layouts exist depending on target chip:
-
-**ESP32 / S3 / C3 (25 columns)**
+The ESP32 streams length-prefixed binary messages over TCP. Every message:
 
 ```
-type, id, mac, rssi, rate, sig_mode, mcs, bandwidth, smoothing, not_sounding,
-aggregation, stbc, fec_coding, sgi, noise_floor, ampdu_cnt, channel,
-secondary_channel, local_timestamp, ant, sig_len, rx_state, len, first_word, data
+u8  type        // 0x01 SESSION_INFO, 0x02 CSI_FRAME, 0x03 HEARTBEAT
+u16 length      // payload length (little-endian, NOT including this 3-byte header)
+u8  payload[length]
 ```
 
-**C5 / C6 / C61 (15 columns)**
+All multi-byte integers are little-endian. Three message types:
 
-```
-type, id, mac, rssi, rate, noise_floor, fft_gain, agc_gain,
-channel, local_timestamp, sig_len, rx_state, len, first_word, data
-```
+| Type | Name | When emitted | Payload |
+|------|------|--------------|---------|
+| `0x01` | `SESSION_INFO` | Once per TCP (re)connect, before any other message | chip_id, csi_format, csi_bytes, MAC, channel, sample_rate_hz, `boot_id` (random per boot), esp_time_us — 26 bytes |
+| `0x02` | `CSI_FRAME` | Once per CSI capture (~100 Hz) | local_timestamp_us, seq, rssi, noise_floor, rate, first_word_invalid, len, followed by `len` raw CSI bytes — 14 byte meta + 128 byte CSI = 142 bytes |
+| `0x03` | `HEARTBEAT` | 1 Hz idle (no CSI sent for ≥1 s) | esp_time_us, rssi, channel, uptime_s, reconnect_count, last_disc_reason — 19 bytes |
 
-The `data` field is a JSON integer array — 128 bytes representing 64 complex subcarriers stored as interleaved `[imag0, real0, imag1, real1, ...]` pairs. The first two subcarriers (indices 0–1) are hardware artifacts and are masked out during analysis.
+The wire format is defined in two places that **MUST stay in sync**:
 
-`local_timestamp` is the ESP32's internal microsecond timer (`esp_timer_get_time()`). Timestamps are non-uniform due to FreeRTOS tick quantization and ping scheduling jitter; the analysis script resamples to a uniform grid before spectral processing.
+- `csi_protocol.py` — Python source of truth. Struct sizes are pinned by unit tests so accidental field additions fail loudly.
+- `main/csi_protocol.h` — ESP32 mirror. Each struct has a `_Static_assert` on its size so a drift fails the firmware build.
+
+The CSI byte payload is 64 complex subcarriers stored as interleaved `[imag0, real0, imag1, real1, ...]` `int8` pairs. The first two subcarriers (indices 0–1) are hardware artifacts and are masked out during analysis. `local_timestamp_us` is the ESP32's internal microsecond timer (`esp_timer_get_time()`); the host loader unwraps the u32 across the ~71 min boundary into a monotonic 64-bit `logical_us` before resampling.
+
+The host loader (`csi_breathing.load_binary`) walks the binary stream and rebuilds the same `CSIDataset` shape the legacy CSV loader produced, so the downstream DSP pipeline is unchanged.
 
 ---
 
@@ -206,14 +212,12 @@ Configurable via `idf.py menuconfig` under **CSI Breathing Monitor** (defined in
 
 | Constant | Default | Description |
 |----------|---------|-------------|
-| `TCP_TX_BUF_SIZE` | `1024` | Per-row CSV buffer size (bytes) |
-| `CSI_STREAM_BUF_BYTES` | `8192` | Stream buffer between CSI callback and writer task (~10 rows) |
+| `TCP_TX_BUF_SIZE` | `256` | Writer task drain buffer size (bytes) — sized for one binary frame |
+| `CSI_STREAM_BUF_BYTES` | `8192` | Stream buffer between CSI callback and writer task (~57 frames) |
 | `TCP_RECONNECT_BACKOFF_MIN_MS` | `500` | Initial TCP reconnect delay |
 | `TCP_RECONNECT_BACKOFF_MAX_MS` | `30000` | Maximum TCP reconnect delay (exponential backoff cap) |
 | `TCP_HEARTBEAT_INTERVAL_US` | `1000000` | Heartbeat period when no CSI is being sent (1 s) |
 | `WIFI_AUTH_FAIL_THRESHOLD` | `5` | Wrong-password failures before NVS erase (pre-first-assoc only) |
-| `CONFIG_GAIN_CONTROL` | `1` (C3/C5/C6/S3) | Enable AGC/FFT gain compensation |
-| `CONFIG_FORCE_GAIN` | `0` | Lock gain to baseline after 100 frames |
 
 ### `sdkconfig.defaults`
 
@@ -232,8 +236,14 @@ esp32-breathing/
 │   ├── Kconfig.projbuild     # menuconfig options (host IP, port, ping rate)
 │   ├── CMakeLists.txt
 │   └── idf_component.yml     # IDF component manager manifest
-├── capture.py                # Host TCP server — writes CSI data to CSV
+├── capture.py                # Host TCP server — writes raw binary stream to .bin
+├── csi_protocol.py           # Python wire-format source of truth
 ├── csi_breathing.py          # Offline analysis — breathing rate estimation + plots
+├── main/csi_protocol.h       # ESP32 mirror of the wire format
+├── tests/                    # pytest suite for protocol + loader
+│   ├── test_binary_protocol.py
+│   ├── test_binary_loader.py
+│   └── test_capture_pipe.py
 ├── CMakeLists.txt            # Top-level IDF project CMake file
 ├── sdkconfig.defaults        # Non-interactive IDF config overrides
 └── CLAUDE.md                 # AI assistant context for this repo
@@ -257,7 +267,7 @@ esp32-breathing/
 - Confirm the host IP in `main/Kconfig.projbuild` (or set via `idf.py menuconfig`) matches the machine running `capture.py`.
 - Check that port 3490 is not blocked: `nc -l 3490` should accept a connection from the ESP32.
 - The serial monitor will log TCP connection attempts and errno values on failure.
-- A heartbeat line (`HEARTBEAT,...`) is sent every 1 s even when no CSI arrives — if you see heartbeats but no `CSI_DATA` rows, the ping path to the router may be blocked.
+- A binary `HEARTBEAT` message is sent every 1 s even when no CSI arrives — `capture.py` updates `last_heartbeat_utc` in the stats sidecar. If you see heartbeats but `frames_written` stays at zero, the ping path to the router may be blocked.
 
 **Estimated breathing rate looks wrong**
 - Collect more data — 60+ seconds is recommended.
@@ -272,7 +282,7 @@ esp32-breathing/
 
 ## References
 
-- Espressif [esp-csi](https://github.com/espressif/esp-csi) — official CSI examples and gain control component
+- Espressif [esp-csi](https://github.com/espressif/esp-csi) — official CSI examples
 - Espressif [ESP-IDF Programming Guide](https://docs.espressif.com/projects/esp-idf/en/latest/)
 - Wang et al., "WiFi CSI-based passive human activity recognition" — BoI subcarrier selection approach
 - PhaseBeat / IndoTrack — phase-difference breathing / motion sensing techniques
