@@ -81,3 +81,72 @@ def iter_messages(buf):
         payload = bytes(buf[off + HEADER.size : end])
         yield msg_type, payload
         off = end
+
+
+from collections import namedtuple
+
+# Decoded views — fields match the struct layout 1:1, plus the trailing csi
+# byte payload for CSI_FRAME.
+SessionInfo = namedtuple(
+    "SessionInfo",
+    "chip_id csi_format csi_bytes mac channel reserved sample_rate_hz "
+    "boot_id esp_time_us",
+)
+CsiFrameMeta = namedtuple(
+    "CsiFrameMeta",
+    "local_timestamp_us seq rssi noise_floor rate first_word_invalid len",
+)
+HeartbeatPayload = namedtuple(
+    "HeartbeatPayload",
+    "esp_time_us rssi channel uptime_s reconnect_count last_disc_reason",
+)
+
+
+def _wrap(msg_type: int, payload: bytes) -> bytes:
+    return pack_header(msg_type, len(payload)) + payload
+
+
+def encode_session_info(*, chip_id, csi_format, csi_bytes, mac, channel,
+                        sample_rate_hz, boot_id, esp_time_us, reserved=0):
+    if len(mac) != 6:
+        raise ValueError("mac must be exactly 6 bytes")
+    body = SESSION_INFO.pack(
+        chip_id, csi_format, csi_bytes, mac, channel, reserved,
+        sample_rate_hz, boot_id, esp_time_us,
+    )
+    return _wrap(MSG_SESSION_INFO, body)
+
+
+def decode_session_info(payload: bytes) -> SessionInfo:
+    return SessionInfo._make(SESSION_INFO.unpack(payload))
+
+
+def encode_csi_frame(*, local_timestamp_us, seq, rssi, noise_floor,
+                     rate, first_word_invalid, csi_bytes):
+    meta = CSI_FRAME_META.pack(
+        local_timestamp_us, seq, rssi, noise_floor,
+        rate, first_word_invalid, len(csi_bytes),
+    )
+    return _wrap(MSG_CSI_FRAME, meta + csi_bytes)
+
+
+def decode_csi_frame(payload: bytes):
+    """Return (CsiFrameMeta, csi_payload_bytes)."""
+    meta = CsiFrameMeta._make(CSI_FRAME_META.unpack_from(payload, 0))
+    csi = payload[CSI_FRAME_META.size : CSI_FRAME_META.size + meta.len]
+    if len(csi) != meta.len:
+        raise ValueError(
+            f"truncated CSI payload: expected {meta.len}, got {len(csi)}"
+        )
+    return meta, csi
+
+
+def encode_heartbeat(*, esp_time_us, rssi, channel, uptime_s,
+                     reconnect_count, last_disc_reason):
+    body = HEARTBEAT.pack(esp_time_us, rssi, channel, uptime_s,
+                          reconnect_count, last_disc_reason)
+    return _wrap(MSG_HEARTBEAT, body)
+
+
+def decode_heartbeat(payload: bytes) -> HeartbeatPayload:
+    return HeartbeatPayload._make(HEARTBEAT.unpack(payload))
