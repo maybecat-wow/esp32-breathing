@@ -34,8 +34,6 @@ app.
   git revision; a one-shot offline converter is not part of this work.
 - C5/C6/C61 support. Firmware code paths for those chips are removed. Target
   is classic ESP32 or ESP32-S3 only.
-- Timestamp wraparound handling (`u32 µs` wraps at ~71 min). Current CSV
-  loader also does not handle this; deferred.
 
 ## Architecture
 
@@ -228,6 +226,34 @@ Add `load_binary(path) -> CsiDataset`:
   today's CSV path).
 - Δt > 500 ms within a session → gap.
 
+#### Timestamp wraparound
+
+`local_timestamp_us` is a u32 in µs, so it wraps at `2^32` ≈ 71.6 min. The
+loader unwraps in-session and exposes a monotonic 64-bit `logical_us` to
+downstream code; the DSP pipeline never sees the raw u32 again.
+
+Per session (i.e. inside one `boot_id`):
+- Track `prev_raw_us` and an accumulating `wrap_offset_us` (multiple of
+  `2^32`, starts at 0).
+- For each CSI_FRAME with raw timestamp `raw`:
+  1. If `raw < prev_raw_us`, that is a wrap (the ESP32 has no other reason
+     to go backward within a boot — REBOOT is signaled by a new SESSION_INFO
+     with a new `boot_id`). Set `wrap_offset_us += 2^32`.
+  2. `logical_us = raw + wrap_offset_us`.
+  3. `prev_raw_us = raw`.
+- The 500 ms gap check, duplicate check, and `Δt` for `fs` estimation all
+  run on `logical_us`, not `raw`. So a wrap is invisible to downstream
+  logic; the stream looks like one continuous monotonic timeline.
+- Sanity: at 100 Hz the inter-frame Δt is 10 ms, so a wrap event yields
+  `raw_new ≈ 0`, `raw_prev ≈ 2^32 - 10_000`. After unwrap, `logical_new -
+  logical_prev = (2^32 + raw_new) - raw_prev ≈ 10_000 µs`. The gap detector
+  sees a normal 10 ms step and does not insert a gap.
+
+On a new SESSION_INFO (any reason — reconnect or reboot), `wrap_offset_us`
+resets to 0 along with `prev_raw_us`, because the firmware's `esp_timer`
+value at the new SESSION_INFO's `esp_time_us` field becomes the authority
+for the new session.
+
 Output type: existing `CsiDataset` (frames + gap indices). The downstream
 DSP pipeline does not change.
 
@@ -267,6 +293,7 @@ Remove the CSV loader path. Old `.csv` files are not readable by post-change
 | Same `boot_id` SESSION_INFO mid-stream | soft gap (TCP reconnect) |
 | Different `boot_id` SESSION_INFO | hard gap, reset session state (REBOOT) |
 | Duplicate `local_timestamp_us` | drop (same as today) |
+| `local_timestamp_us` wrap (raw < prev_raw, same boot_id) | unwrap: `wrap_offset_us += 2^32`; expose monotonic `logical_us` downstream |
 
 ## Testing
 
@@ -288,6 +315,17 @@ Remove the CSV loader path. Old `.csv` files are not readable by post-change
 7. **Duplicate timestamp.** Two CSI_FRAMEs with identical
    `local_timestamp_us`. First kept; second dropped.
 8. **>500 ms timestamp jump.** Δt > 500 ms triggers gap insertion.
+9. **Timestamp wrap, continuous.** Two CSI_FRAMEs straddling a u32 wrap:
+   `raw_prev = 2^32 - 5_000`, `raw_new = 5_000` (10 ms apart). Loader exposes
+   `logical_us` deltas of 10_000 µs; no gap inserted; downstream `fs`
+   estimate unchanged.
+10. **Timestamp wrap, multi.** Sequence of 5 frames straddling two wraps.
+    Resulting `logical_us` strictly monotonic; total span = sum of
+    inter-frame Δt (no gaps).
+11. **Wrap vs reboot disambiguation.** Backward-jumping raw timestamp with
+    *same* `boot_id` → unwrap. Backward-jumping raw timestamp following a
+    SESSION_INFO with *new* `boot_id` → reset, no unwrap applied, hard gap
+    boundary visible in dataset.
 
 ### ESP32 manual smoke
 
@@ -305,6 +343,4 @@ Remove the CSV loader path. Old `.csv` files are not readable by post-change
 
 ## Open questions
 
-None. All design decisions resolved during brainstorming. (Wraparound of
-`u32 local_timestamp_us` at ~71 min is a known limitation inherited from
-the current CSV path and is explicitly out of scope.)
+None. All design decisions resolved during brainstorming.
