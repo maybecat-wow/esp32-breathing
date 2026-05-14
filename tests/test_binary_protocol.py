@@ -33,9 +33,6 @@ def test_heartbeat_struct_size():
     assert p.HEARTBEAT.size == 19
 
 
-import os
-
-
 def _sample_session_info(boot_id: int = 0xDEADBEEF) -> bytes:
     return p.encode_session_info(
         chip_id=1, csi_format=0, csi_bytes=128,

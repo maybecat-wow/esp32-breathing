@@ -9,6 +9,7 @@ All multibyte integers are little-endian. Every message on the wire is:
 See docs/superpowers/specs/2026-05-14-binary-csi-protocol-design.md.
 """
 import struct
+from collections import namedtuple
 
 # ── Message types ──────────────────────────────────────────────────────────
 MSG_SESSION_INFO = 0x01
@@ -82,8 +83,6 @@ def iter_messages(buf):
         yield msg_type, payload
         off = end
 
-
-from collections import namedtuple
 
 # Decoded views — fields match the struct layout 1:1, plus the trailing csi
 # byte payload for CSI_FRAME.
