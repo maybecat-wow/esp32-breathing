@@ -173,3 +173,13 @@ def test_length_overflow_stops_walk():
     ds = load_binary_bytes(stream)
     # First frame is kept; oversized header halts walk before garbage is read.
     assert ds.num_frames == 1
+
+
+def test_parse_file_dispatches_to_binary(tmp_path):
+    stream = _session_info() + _csi_frame(10_000, 0)
+    binpath = tmp_path / "smoke.bin"
+    binpath.write_bytes(stream)
+    from csi_breathing import parse_file
+    ds = parse_file(str(binpath))
+    assert ds.num_frames == 1
+    assert ds.frames[0].local_timestamp == 10_000

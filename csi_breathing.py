@@ -635,7 +635,10 @@ def _parse_serial(filepath: str) -> CSIDataset:
 
 
 def parse_file(filepath: str) -> CSIDataset:
-    """Auto-detect format and parse ESP32 CSI data file into CSIDataset."""
+    """Dispatch by file extension. .bin → binary loader, .csv → CSV, else
+    falls through to the serial-monitor sniffer for legacy files."""
+    if filepath.endswith(".bin"):
+        return load_binary(filepath)
     fmt = _detect_format(filepath)
     if fmt in ("csv", "csv_no_header"):
         return _parse_csv(filepath)
