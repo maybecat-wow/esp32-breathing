@@ -71,7 +71,6 @@
 #include "lwip/err.h"
 #include "ping/ping_sock.h"
 
-#include "esp_csi_gain_ctrl.h"
 #include "esp_random.h"
 
 #include "csi_protocol.h"
@@ -126,7 +125,7 @@ static uint32_t s_boot_id = 0;
 
 static int          s_tcp_sock   = -1;          /* socket fd, -1 = disconnected */
 static SemaphoreHandle_t s_tcp_mutex = NULL;    /* guards all fields below      */
-static bool         s_header_sent = false;      /* have we sent SESSION_INFO?    */
+static bool         s_session_info_sent = false;      /* have we sent SESSION_INFO?    */
 static int64_t      s_last_tx_us  = 0;          /* esp_timer_get_time() of last successful send */
 
 /* Observability fields for the periodic heartbeat line. Updated from the
@@ -217,7 +216,7 @@ static void tcp_send_locked(const char *buf, int len)
             ESP_LOGW(TAG, "send() failed (errno %d) — closing socket", errno);
             close(s_tcp_sock);
             s_tcp_sock    = -1;
-            s_header_sent = false;
+            s_session_info_sent = false;
             return;
         }
         sent += n;
@@ -232,7 +231,7 @@ static void tcp_send_locked(const char *buf, int len)
  */
 static void tcp_send_session_info_locked(void)
 {
-    if (s_tcp_sock < 0 || s_header_sent) return;
+    if (s_tcp_sock < 0 || s_session_info_sent) return;
 
     wifi_ap_record_t ap = {0};
     uint8_t channel = 0;
@@ -267,7 +266,7 @@ static void tcp_send_session_info_locked(void)
     info->esp_time_us    = (uint64_t)esp_timer_get_time();
 
     tcp_send_locked((const char *)buf, sizeof(buf));
-    s_header_sent = true;
+    s_session_info_sent = true;
 }
 
 /**
@@ -278,7 +277,7 @@ static void tcp_send_session_info_locked(void)
  */
 static void tcp_send_heartbeat_locked(void)
 {
-    if (s_tcp_sock < 0 || !s_header_sent) return;
+    if (s_tcp_sock < 0 || !s_session_info_sent) return;
 
     wifi_ap_record_t ap = {0};
     int8_t rssi = 0;
@@ -325,7 +324,7 @@ static void tcp_writer_task(void *arg)
         /* SESSION_INFO is sent on connect from tcp_reconnect_task, so by the
            time we have data the socket is either healthy or the reconnect
            task is currently bringing it back up. In the latter case, drop. */
-        if (s_tcp_sock >= 0 && s_header_sent) {
+        if (s_tcp_sock >= 0 && s_session_info_sent) {
             tcp_send_locked(buf, (int)n);
         }
         xSemaphoreGive(s_tcp_mutex);
@@ -379,7 +378,7 @@ static void tcp_reconnect_task(void *arg)
             int sock = tcp_connect();
             xSemaphoreTake(s_tcp_mutex, portMAX_DELAY);
             s_tcp_sock    = sock;
-            s_header_sent = false;   /* re-send SESSION_INFO on new connection */
+            s_session_info_sent = false;   /* re-send SESSION_INFO on new connection */
             if (sock >= 0) {
                 s_last_tx_us = esp_timer_get_time();
                 /* Send SESSION_INFO immediately so capture.py's recv timeout
