@@ -52,3 +52,54 @@ def test_load_endian_and_imag_real_order():
     csi = ds.frames[0].raw_csi
     assert csi[0] == complex(2, 1)
     assert csi[1] == complex(-2, -1)
+
+
+def test_reconnect_same_boot_id_no_hard_gap():
+    # Same boot_id between two session blocks → soft (TCP reconnect).
+    # No gap is recorded because the second SESSION_INFO arrives between
+    # frames and there's no timestamp discontinuity yet.
+    stream = (
+        _session_info(boot_id=1)
+        + _csi_frame(10_000, 0)
+        + _session_info(boot_id=1)
+        + _csi_frame(20_000, 1)
+    )
+    ds = load_binary_bytes(stream)
+    assert ds.num_frames == 2
+    assert ds.gap_indices == []
+
+
+def test_reboot_different_boot_id_hard_gap():
+    stream = (
+        _session_info(boot_id=1)
+        + _csi_frame(10_000, 0)
+        + _session_info(boot_id=2)   # reboot
+        + _csi_frame(10_000, 0)      # ESP32 timer restarted near zero
+    )
+    ds = load_binary_bytes(stream)
+    assert ds.num_frames == 2
+    assert ds.gap_indices == [1]  # gap at index of first post-reboot frame
+
+
+def test_duplicate_timestamp_dropped():
+    stream = (
+        _session_info()
+        + _csi_frame(10_000, 0)
+        + _csi_frame(10_000, 1)   # duplicate ts
+        + _csi_frame(20_000, 2)
+    )
+    ds = load_binary_bytes(stream)
+    assert ds.num_frames == 2
+    seqs = [f.seq for f in ds.frames]
+    assert seqs == [0, 2]
+
+
+def test_500ms_jump_inserts_gap():
+    stream = (
+        _session_info()
+        + _csi_frame(10_000, 0)
+        + _csi_frame(600_000, 1)   # 590 ms later → > 500 ms
+    )
+    ds = load_binary_bytes(stream)
+    assert ds.num_frames == 2
+    assert ds.gap_indices == [1]
