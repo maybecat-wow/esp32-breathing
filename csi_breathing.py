@@ -36,6 +36,8 @@ import numpy as np
 from matplotlib.gridspec import GridSpec
 from scipy import signal as sig
 
+import csi_protocol as _proto
+
 try:
     import pywt
 
@@ -340,10 +342,9 @@ def _frame_from_fields(
 
 
 # ---------------------------------------------------------------------------
-# Binary loader — wire protocol defined in csi_protocol.py
+# Binary loader — wire protocol defined in csi_protocol.py (imported as
+# _proto at the top of this file).
 # ---------------------------------------------------------------------------
-
-import csi_protocol as _proto
 
 
 def _csi_bytes_to_complex(csi_bytes: bytes) -> np.ndarray:
@@ -382,9 +383,6 @@ def load_binary_bytes(stream: bytes) -> CSIDataset:
     prev_raw_us = None
     prev_logical_us = None
     wrap_offset_us = 0
-
-    # 500 ms gap threshold (matches capture.py GAP_THRESHOLD_US).
-    GAP_THRESHOLD_US = 500_000
 
     def _start_new_session(info: "_proto.SessionInfo", hard_gap: bool):
         nonlocal session_boot_id, session_csi_bytes
@@ -428,7 +426,7 @@ def load_binary_bytes(stream: bytes) -> CSIDataset:
             raw = meta.local_timestamp_us
             if prev_raw_us is not None and raw < prev_raw_us:
                 # Backward jump within one boot_id: u32 wrap.
-                wrap_offset_us += 1 << 32
+                wrap_offset_us += _proto.U32_WRAP
             logical_us = raw + wrap_offset_us
             prev_raw_us = raw
 
@@ -438,7 +436,7 @@ def load_binary_bytes(stream: bytes) -> CSIDataset:
 
             # >500 ms jump → mark gap before recording the frame.
             if (prev_logical_us is not None
-                    and logical_us - prev_logical_us > GAP_THRESHOLD_US):
+                    and logical_us - prev_logical_us > _proto.GAP_THRESHOLD_US):
                 idx = dataset.num_frames
                 if not dataset.gap_indices or dataset.gap_indices[-1] != idx:
                     dataset.gap_indices.append(idx)

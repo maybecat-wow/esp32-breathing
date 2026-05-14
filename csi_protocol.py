@@ -19,6 +19,14 @@ MSG_HEARTBEAT    = 0x03
 # ── Limits ─────────────────────────────────────────────────────────────────
 MAX_PAYLOAD_BYTES = 4096   # host parser closes the socket if length exceeds this
 
+# ── Gap detection (shared between live capture.py and offline loader) ──────
+# An inter-frame gap in `local_timestamp_us` greater than this is treated as
+# a discontinuity (CSI_GAP marker live; gap_indices entry offline).
+GAP_THRESHOLD_US = 500_000   # 500 ms
+
+# u32 wrap boundary for ESP32's local_timestamp_us (~71.6 min).
+U32_WRAP = 1 << 32
+
 # ── Wire structs (little-endian, no padding) ───────────────────────────────
 # Every Struct format starts with "<" to force little-endian and unaligned packing.
 
