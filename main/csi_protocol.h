@@ -16,7 +16,6 @@
 #pragma once
 
 #include <stdint.h>
-#include <assert.h>
 
 #define MSG_SESSION_INFO  0x01
 #define MSG_CSI_FRAME     0x02
