@@ -103,3 +103,57 @@ def test_500ms_jump_inserts_gap():
     ds = load_binary_bytes(stream)
     assert ds.num_frames == 2
     assert ds.gap_indices == [1]
+
+
+UINT32 = 1 << 32
+
+
+def test_wraparound_single():
+    # Two frames 10 ms apart straddling the u32 wrap boundary.
+    raw_prev = UINT32 - 5_000   # would be 0xFFFFEC78
+    raw_new = 5_000             # post-wrap
+    stream = (
+        _session_info()
+        + _csi_frame(raw_prev, 0)
+        + _csi_frame(raw_new, 1)
+    )
+    ds = load_binary_bytes(stream)
+    assert ds.num_frames == 2
+    assert ds.gap_indices == []  # no gap — looks like a continuous 10 ms step
+    logical = [f.local_timestamp for f in ds.frames]
+    assert logical[1] - logical[0] == 10_000
+
+
+def test_wraparound_multiple():
+    # 5 frames straddling two wraps, each 10 ms apart in raw terms.
+    raws = [
+        UINT32 - 30_000,   # pre-wrap
+        UINT32 - 20_000,
+        UINT32 - 10_000,
+        0,                 # wrap #1
+        10_000,
+    ]
+    stream = _session_info()
+    for i, t in enumerate(raws):
+        stream += _csi_frame(t, i)
+    ds = load_binary_bytes(stream)
+    assert ds.num_frames == 5
+    assert ds.gap_indices == []
+    logical = [f.local_timestamp for f in ds.frames]
+    diffs = np.diff(logical)
+    assert (diffs == 10_000).all()
+
+
+def test_wrap_vs_reboot_disambiguation():
+    # Backward jump WITH new boot_id → reboot, not wrap. Hard gap, no unwrap.
+    stream = (
+        _session_info(boot_id=1)
+        + _csi_frame(UINT32 - 5_000, 0)
+        + _session_info(boot_id=2)
+        + _csi_frame(5_000, 0)       # raw 5_000 in the new boot
+    )
+    ds = load_binary_bytes(stream)
+    assert ds.num_frames == 2
+    assert ds.gap_indices == [1]
+    # Post-reboot frame's logical_us is its raw value (no offset).
+    assert ds.frames[1].local_timestamp == 5_000
