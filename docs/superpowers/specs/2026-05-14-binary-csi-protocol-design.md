@@ -47,7 +47,7 @@ ESP32 (S3 or classic, LLTF only)
 Host
   capture.py           accepts TCP, peeks msg types for stats, writes raw
                        bytes verbatim to <store>.bin
-  csi_breathing.py     mmap .bin, walk messages, build CsiDataset, run DSP
+  csi_breathing.py     read .bin, walk messages, build CsiDataset, run DSP
 ```
 
 `capture.py` is intentionally a near-dumb pipe on the hot path — it does not
@@ -121,7 +121,7 @@ u8   last_disc_reason
 ### Bytes per second
 
 At 100 Hz with csi_bytes=128:
-- CSI_FRAME: 3 + 12 + 128 = 143 B/frame → 14.3 KB/s
+- CSI_FRAME: 3 + 14 + 128 = 145 B/frame → 14.5 KB/s
 - HEARTBEAT/SESSION_INFO: negligible
 
 vs. current CSV ~70 KB/s. ~5× reduction.
@@ -210,7 +210,7 @@ stats.json: same shape as today. `frames_written`, `gap_count`,
 ### `csi_breathing.py` — binary loader
 
 Add `load_binary(path) -> CsiDataset`:
-- `mmap` the file.
+- Read the file into bytes (overnight captures are ~50 MB, fits in RAM trivially; `iter_messages` also accepts an `mmap.mmap` if a future deployment grows past that).
 - Walk: `type, length = struct.unpack_from('<BH', mm, off)`; advance.
 - Dispatch:
   - `MSG_SESSION_INFO`: update current session state (csi_bytes,
@@ -257,8 +257,12 @@ for the new session.
 Output type: existing `CsiDataset` (frames + gap indices). The downstream
 DSP pipeline does not change.
 
-Remove the CSV loader path. Old `.csv` files are not readable by post-change
-`csi_breathing.py`.
+**Deviation from original spec:** the CSV / serial-monitor loader path
+(`_parse_csv`, `_parse_serial`, `_detect_format`, `parse_csi_values`) was
+preserved rather than deleted. `parse_file` routes `.bin` → `load_binary`
+and falls through to the legacy paths for any other extension. This lets
+existing `.csv` recordings stay readable after the migration. New
+captures from updated firmware are always `.bin`.
 
 ### CLAUDE.md updates
 
