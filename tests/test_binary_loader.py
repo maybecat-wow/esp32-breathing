@@ -161,16 +161,15 @@ def test_wrap_vs_reboot_disambiguation():
 
 def test_length_overflow_stops_walk():
     # type=MSG_CSI_FRAME, length=0xFFFF — way past MAX_PAYLOAD_BYTES.
-    # The walker would happily try to slice that many bytes; the loader
-    # must clamp.
+    # Trailing garbage bytes ensure the walker isn't merely stopped by EOF;
+    # the oversized-length cap in iter_messages must be what halts it.
+    garbage = b"\x00" * 0xFFFF
     stream = (
         _session_info()
         + _csi_frame(10_000, 0)
-        + p.pack_header(p.MSG_CSI_FRAME, 0xFFFF)  # no payload bytes after
+        + p.pack_header(p.MSG_CSI_FRAME, 0xFFFF)
+        + garbage
     )
     ds = load_binary_bytes(stream)
-    # First frame was good; oversized header consumes the rest as truncated.
+    # First frame is kept; oversized header halts walk before garbage is read.
     assert ds.num_frames == 1
-    # We don't strictly require skipped_rows here — the truncated message
-    # never yielded, so it's silently dropped by iter_messages. The point of
-    # the test is just that the loader doesn't crash or loop.

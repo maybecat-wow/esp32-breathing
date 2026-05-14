@@ -71,11 +71,13 @@ def pack_header(msg_type: int, length: int) -> bytes:
     return HEADER.pack(msg_type, length)
 
 
-def iter_messages(buf):
+def iter_messages(buf, max_payload=MAX_PAYLOAD_BYTES):
     """Yield (msg_type, payload_bytes) for each complete message in *buf*.
 
-    Stops at the first truncated message (i.e. EOF mid-message) without raising,
-    so callers can walk a partially-written .bin file safely.
+    Stops cleanly (no raise) on either:
+    - truncated tail (EOF mid-message), or
+    - oversized length field (> max_payload), which signals stream corruption
+      or version mismatch and is unsafe to walk past.
 
     *buf* may be `bytes`, `bytearray`, or a `mmap.mmap` — anything that supports
     slicing and `len()`.
@@ -84,6 +86,8 @@ def iter_messages(buf):
     total = len(buf)
     while off + HEADER.size <= total:
         msg_type, length = HEADER.unpack_from(buf, off)
+        if length > max_payload:
+            return  # corrupt / oversized — stop before consuming garbage
         end = off + HEADER.size + length
         if end > total:
             return  # truncated tail — stop cleanly
