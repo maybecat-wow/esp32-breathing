@@ -25,6 +25,7 @@ Dependencies: numpy, scipy, matplotlib, pywt (PyWavelets)
 import argparse
 import os
 import re
+import struct
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -336,6 +337,153 @@ def _frame_from_fields(
         first_word=first_word,
         raw_csi=raw_csi,
     )
+
+
+# ---------------------------------------------------------------------------
+# Binary loader — wire protocol defined in csi_protocol.py
+# ---------------------------------------------------------------------------
+
+import csi_protocol as _proto
+
+
+def _csi_bytes_to_complex(csi_bytes: bytes) -> np.ndarray:
+    """Decode ESP32 raw CSI bytes into a complex64 subcarrier array.
+
+    Wire layout: pairs of signed int8s, (imag, real). Mirrors
+    parse_csi_values() for CSV input but operates on raw bytes.
+    """
+    # np.frombuffer with int8 reinterprets the unsigned bytes as signed.
+    raw = np.frombuffer(csi_bytes, dtype=np.int8)
+    num_complex = len(raw) // 2
+    imag = raw[0 : 2 * num_complex : 2].astype(np.float32)
+    real = raw[1 : 2 * num_complex : 2].astype(np.float32)
+    return (real + 1j * imag).astype(np.complex64)
+
+
+def load_binary_bytes(stream: bytes) -> CSIDataset:
+    """Parse a complete binary capture *stream* (bytes/bytearray/mmap) into a CSIDataset.
+
+    The walker processes messages with `csi_protocol.iter_messages`. The first
+    message of each session establishes csi_bytes, sample_rate, and boot_id;
+    subsequent CSI_FRAMEs build CSIFrames; HEARTBEATs are ignored for now.
+
+    Session boundaries that don't carry frames between them are not recorded as
+    gaps (no visible discontinuity in the frame timeline).
+    """
+    dataset = CSIDataset()
+
+    # Per-session state.
+    session_boot_id = None
+    session_csi_bytes = None
+    session_mac = ""
+    session_channel = 0
+
+    # Wraparound + monotonicity state, valid within a single boot_id.
+    prev_raw_us = None
+    prev_logical_us = None
+    wrap_offset_us = 0
+
+    # 500 ms gap threshold (matches capture.py GAP_THRESHOLD_US).
+    GAP_THRESHOLD_US = 500_000
+
+    def _start_new_session(info: "_proto.SessionInfo", hard_gap: bool):
+        nonlocal session_boot_id, session_csi_bytes
+        nonlocal session_mac, session_channel
+        nonlocal prev_raw_us, prev_logical_us, wrap_offset_us
+        session_boot_id = info.boot_id
+        session_csi_bytes = info.csi_bytes
+        # mac is bytes; render as colon-hex to match CSIFrame.mac type (str).
+        session_mac = ":".join(f"{b:02x}" for b in info.mac)
+        session_channel = info.channel
+        prev_raw_us = None
+        prev_logical_us = None
+        wrap_offset_us = 0
+        if hard_gap and dataset.num_frames > 0:
+            idx = dataset.num_frames
+            if not dataset.gap_indices or dataset.gap_indices[-1] != idx:
+                dataset.gap_indices.append(idx)
+
+    for msg_type, payload in _proto.iter_messages(stream):
+        if msg_type == _proto.MSG_SESSION_INFO:
+            try:
+                info = _proto.decode_session_info(payload)
+            except struct.error:
+                dataset.skipped_rows += 1
+                continue
+            hard = session_boot_id is not None and info.boot_id != session_boot_id
+            _start_new_session(info, hard_gap=hard)
+            continue
+
+        if msg_type == _proto.MSG_CSI_FRAME:
+            if session_csi_bytes is None:
+                # Frame before any SESSION_INFO — corrupt stream prefix.
+                dataset.skipped_rows += 1
+                continue
+            try:
+                meta, csi_bytes = _proto.decode_csi_frame(payload)
+            except (struct.error, ValueError):
+                dataset.skipped_rows += 1
+                continue
+
+            raw = meta.local_timestamp_us
+            if prev_raw_us is not None and raw < prev_raw_us:
+                # Backward jump within one boot_id: u32 wrap.
+                wrap_offset_us += 1 << 32
+            logical_us = raw + wrap_offset_us
+            prev_raw_us = raw
+
+            # Duplicate timestamp → drop (parity with old CSV loader).
+            if prev_logical_us is not None and logical_us == prev_logical_us:
+                continue
+
+            # >500 ms jump → mark gap before recording the frame.
+            if (prev_logical_us is not None
+                    and logical_us - prev_logical_us > GAP_THRESHOLD_US):
+                idx = dataset.num_frames
+                if not dataset.gap_indices or dataset.gap_indices[-1] != idx:
+                    dataset.gap_indices.append(idx)
+
+            prev_logical_us = logical_us
+
+            frame = _frame_from_fields(
+                seq=meta.seq,
+                mac=session_mac,
+                rssi=meta.rssi,
+                rate=meta.rate,
+                sig_mode=0, mcs=0, bandwidth=0, smoothing=0,
+                not_sounding=0, aggregation=0, stbc=0,
+                fec_coding=0, sgi=0,
+                noise_floor=meta.noise_floor,
+                ampdu_cnt=0,
+                channel=session_channel,
+                secondary_channel=0,
+                local_timestamp=logical_us,
+                ant=0,
+                sig_len=0,
+                rx_state=0,
+                csi_len=meta.len,
+                first_word=meta.first_word_invalid,
+                raw_csi=_csi_bytes_to_complex(csi_bytes),
+            )
+            dataset.frames.append(frame)
+            continue
+
+        if msg_type == _proto.MSG_HEARTBEAT:
+            # Heartbeats are informational; could record on dataset later if
+            # the analysis ever needs link-health context.
+            continue
+
+        # Unknown type: walker has already advanced past it; just count.
+        dataset.skipped_rows += 1
+
+    return dataset
+
+
+def load_binary(filepath: str) -> CSIDataset:
+    """Open *filepath* as a binary capture and parse it."""
+    with open(filepath, "rb") as f:
+        data = f.read()
+    return load_binary_bytes(data)
 
 
 def _parse_csv(filepath: str) -> CSIDataset:
