@@ -157,3 +157,20 @@ def test_wrap_vs_reboot_disambiguation():
     assert ds.gap_indices == [1]
     # Post-reboot frame's logical_us is its raw value (no offset).
     assert ds.frames[1].local_timestamp == 5_000
+
+
+def test_length_overflow_stops_walk():
+    # type=MSG_CSI_FRAME, length=0xFFFF — way past MAX_PAYLOAD_BYTES.
+    # The walker would happily try to slice that many bytes; the loader
+    # must clamp.
+    stream = (
+        _session_info()
+        + _csi_frame(10_000, 0)
+        + p.pack_header(p.MSG_CSI_FRAME, 0xFFFF)  # no payload bytes after
+    )
+    ds = load_binary_bytes(stream)
+    # First frame was good; oversized header consumes the rest as truncated.
+    assert ds.num_frames == 1
+    # We don't strictly require skipped_rows here — the truncated message
+    # never yielded, so it's silently dropped by iter_messages. The point of
+    # the test is just that the loader doesn't crash or loop.
