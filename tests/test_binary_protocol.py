@@ -115,3 +115,41 @@ def test_iter_messages_mixed_stream():
         p.MSG_HEARTBEAT,
         p.MSG_CSI_FRAME,
     ]
+
+
+def test_iter_messages_truncated_tail():
+    csi = bytes(range(128))
+    full = _sample_session_info() + _sample_csi_frame(10_000, 0, csi)
+    # Chop the last 5 bytes off (mid-CSI payload).
+    truncated = full[:-5]
+    msgs = list(p.iter_messages(truncated))
+    # SESSION_INFO is complete, CSI_FRAME is partial → only SESSION_INFO yields.
+    assert len(msgs) == 1
+    assert msgs[0][0] == p.MSG_SESSION_INFO
+
+
+def test_iter_messages_unknown_type_zero_length():
+    # \xFF type, length=0 → opaque message but well-formed. The walker should
+    # skip it and continue to the next message rather than stalling.
+    csi = bytes(range(128))
+    stream = (
+        _sample_csi_frame(10_000, 0, csi)
+        + p.pack_header(0xFF, 0)
+        + _sample_csi_frame(20_000, 1, csi)
+    )
+    types = [t for (t, _) in p.iter_messages(stream)]
+    assert types == [p.MSG_CSI_FRAME, 0xFF, p.MSG_CSI_FRAME]
+
+
+def test_iter_messages_unknown_type_with_payload():
+    # Non-zero length unknown type: walker still advances by length, but the
+    # consumer dispatch is what decides to ignore it. Just verify it doesn't
+    # corrupt the stream walk.
+    csi = bytes(range(128))
+    stream = (
+        _sample_csi_frame(10_000, 0, csi)
+        + p.pack_header(0x42, 7) + b"\x00" * 7
+        + _sample_csi_frame(20_000, 1, csi)
+    )
+    types = [t for (t, _) in p.iter_messages(stream)]
+    assert types == [p.MSG_CSI_FRAME, 0x42, p.MSG_CSI_FRAME]
