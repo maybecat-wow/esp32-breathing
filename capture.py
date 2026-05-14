@@ -23,6 +23,7 @@ import datetime as _dt
 import json
 import os
 import socket
+import struct
 import sys
 import time
 
@@ -92,7 +93,7 @@ class CaptureSession:
         if msg_type == proto.MSG_SESSION_INFO:
             try:
                 info = proto.decode_session_info(payload)
-            except Exception:
+            except (struct.error, ValueError):
                 return
             hard = (self.session_boot_id is not None
                     and info.boot_id != self.session_boot_id)
@@ -106,13 +107,19 @@ class CaptureSession:
         elif msg_type == proto.MSG_CSI_FRAME:
             try:
                 meta, _ = proto.decode_csi_frame(payload)
-            except Exception:
+            except (struct.error, ValueError):
                 return
             raw = meta.local_timestamp_us
             if self.prev_raw_us is not None and raw < self.prev_raw_us:
                 self.wrap_offset_us += proto.U32_WRAP
             logical = raw + self.wrap_offset_us
             self.prev_raw_us = raw
+
+            # Duplicate-timestamp parity with the loader: a frame with the same
+            # logical_us as the last accepted one is dropped on the analysis
+            # side, so don't count it here either.
+            if self.prev_logical_us is not None and logical == self.prev_logical_us:
+                return
 
             if (self.prev_logical_us is not None
                     and logical - self.prev_logical_us > proto.GAP_THRESHOLD_US):
@@ -195,6 +202,9 @@ def consume_connection(conn: socket.socket, session: CaptureSession):
         return
     if length > proto.MAX_PAYLOAD_BYTES:
         print(f"SESSION_INFO length {length} exceeds cap — closing")
+        session.log_fd.write(
+            f"session-info oversized length {length} — closing\n")
+        session.log_fd.flush()
         return
 
     payload = _recv_exact(conn, length)
