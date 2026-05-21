@@ -8,3 +8,5 @@ dependencies.lock
 __pycache__/
 *.pyc
 *.bin
+/csi_results/
+csi_data*

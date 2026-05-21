@@ -77,7 +77,11 @@ No on-wire gap marker. Gaps are derived host-side from: timestamp jumps,
 connection drops (`recv` returns 0 or timeout), and SESSION_INFO boundaries
 between frames.
 
+<<<<<<< Updated upstream
 ### 0x01 SESSION_INFO (~24 B)
+=======
+### 0x01 SESSION_INFO (26 B payload)
+>>>>>>> Stashed changes
 
 ```
 u8   chip_id          1 = classic ESP32, 2 = ESP32-S3
@@ -92,7 +96,11 @@ u32  boot_id          esp_random() captured once at boot; used to
 u64  esp_time_us      esp_timer_get_time() at send
 ```
 
+<<<<<<< Updated upstream
 ### 0x02 CSI_FRAME (~140 B at csi_bytes=128)
+=======
+### 0x02 CSI_FRAME (142 B payload at csi_bytes=128)
+>>>>>>> Stashed changes
 
 ```
 u32  local_timestamp_us   rx_ctrl->timestamp; monotonic between reboots
@@ -107,7 +115,11 @@ u8   data[len]            raw bytes of info->buf — no gain compensation
                           anyway; S3 path skips it to keep frames cheap)
 ```
 
+<<<<<<< Updated upstream
 ### 0x03 HEARTBEAT (~16 B)
+=======
+### 0x03 HEARTBEAT (19 B payload)
+>>>>>>> Stashed changes
 
 ```
 u64  esp_time_us
@@ -134,7 +146,11 @@ vs. current CSV ~70 KB/s. ~5× reduction.
 
 - `#define MSG_SESSION_INFO 0x01`, `MSG_CSI_FRAME 0x02`, `MSG_HEARTBEAT 0x03`.
 - Packed structs for each payload, `__attribute__((packed))`.
+<<<<<<< Updated upstream
 - `_Static_assert(sizeof(csi_frame_meta_t) == 12, "...")` etc. to catch
+=======
+- `_Static_assert(sizeof(csi_frame_meta_t) == 14, "...")` etc. to catch
+>>>>>>> Stashed changes
   accidental padding from future field additions.
 
 ### Modify `app_main.c`

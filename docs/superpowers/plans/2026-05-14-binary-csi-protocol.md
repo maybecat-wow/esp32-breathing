@@ -93,7 +93,11 @@ def test_header_struct_size():
 def test_session_info_struct_size():
     # u8 chip_id, u8 csi_format, u16 csi_bytes, u8 mac[6], u8 channel,
     # u8 reserved, u16 sample_rate_hz, u32 boot_id, u64 esp_time_us
+<<<<<<< Updated upstream
     assert p.SESSION_INFO.size == 24
+=======
+    assert p.SESSION_INFO.size == 26
+>>>>>>> Stashed changes
 
 
 def test_csi_frame_meta_struct_size():
@@ -108,7 +112,11 @@ def test_heartbeat_struct_size():
     assert p.HEARTBEAT.size == 19
 ```
 
+<<<<<<< Updated upstream
 Note: design doc said ~24 / ~140 / ~16 — those were rough estimates including the 3-byte header. Exact `.size` values pinned here are payload-only.
+=======
+Note: payload `.size` values (26 / 14 / 19) match the `_Static_assert`s in `csi_protocol.h`.
+>>>>>>> Stashed changes
 
 - [ ] **Step 4: Run tests to verify they fail**
 
@@ -1457,7 +1465,11 @@ typedef struct __attribute__((packed)) {
                                   reboot from TCP reconnect */
     uint64_t esp_time_us;
 } csi_session_info_t;
+<<<<<<< Updated upstream
 _Static_assert(sizeof(csi_session_info_t) == 24, "csi_session_info_t size drift");
+=======
+_Static_assert(sizeof(csi_session_info_t) == 26, "csi_session_info_t size drift");
+>>>>>>> Stashed changes
 
 /* CSI_FRAME meta block (14 bytes). The csi byte payload (length = `len`)
  * follows this struct in the message. */
