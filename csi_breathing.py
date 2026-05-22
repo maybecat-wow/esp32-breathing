@@ -393,9 +393,15 @@ def load_binary_bytes(stream: bytes) -> CSIDataset:
         # mac is bytes; render as colon-hex to match CSIFrame.mac type (str).
         session_mac = ":".join(f"{b:02x}" for b in info.mac)
         session_channel = info.channel
-        prev_raw_us = None
-        prev_logical_us = None
-        wrap_offset_us = 0
+        # Only a real reboot (hard_gap) restarts the ESP32 timer. A soft TCP
+        # reconnect keeps the same boot_id and the same free-running u32 clock,
+        # so the accumulated wrap_offset_us MUST survive — resetting it here
+        # folds every post-reconnect frame back into [0, 71min] and collapses
+        # the timeline.
+        if hard_gap:
+            prev_raw_us = None
+            prev_logical_us = None
+            wrap_offset_us = 0
         if hard_gap and dataset.num_frames > 0:
             idx = dataset.num_frames
             if not dataset.gap_indices or dataset.gap_indices[-1] != idx:
@@ -1715,12 +1721,17 @@ def plot_comprehensive_analysis(
 # ---------------------------------------------------------------------------
 
 
-def _estimate_rate_for_window(dataset: CSIDataset, method: str) -> float:
-    """Run the core breathing-rate estimator on a short window and return the
-    estimated rate in BPM, or NaN if the window is unusable."""
+def _estimate_rate_for_window(dataset: CSIDataset, method: str) -> tuple:
+    """Run the core breathing-rate estimator on a short window.
+
+    Returns ``(rate_bpm, snr, reason)``. ``rate_bpm`` and ``snr`` are NaN when
+    the window is unusable; ``reason`` is an empty string on success or a short
+    failure description. ``snr`` is the PSD peak divided by the median in-band
+    PSD — a low value means the picked rate is a noise peak, not breathing."""
+    nan = float("nan")
     n = dataset.num_frames
     if n < 50:
-        return float("nan")
+        return nan, nan, "too few frames"
     csi_raw = dataset.csi_matrix()
     _, M = csi_raw.shape
     csi_ordered_raw = reorder_subcarriers(csi_raw)
@@ -1734,12 +1745,18 @@ def _estimate_rate_for_window(dataset: CSIDataset, method: str) -> float:
             csi_ordered, fs, method=method, valid_mask=valid_mask
         )
         filtered = bandpass_filter(breath_raw, fs, BREATH_FREQ_LO, BREATH_FREQ_HI)
-        rate, _, _, _, reason = estimate_breathing_rate_psd(filtered, fs)
+        rate, _, freqs_psd, psd_vals, reason = estimate_breathing_rate_psd(
+            filtered, fs
+        )
         if reason:
-            return float("nan")
-        return float(rate)
+            return nan, nan, reason
+        band = (freqs_psd >= BREATH_FREQ_LO) & (freqs_psd <= BREATH_FREQ_HI)
+        psd_band = psd_vals[band]
+        med = float(np.median(psd_band)) if psd_band.size else 0.0
+        snr = float(np.max(psd_band) / med) if med > 0 and psd_band.size else nan
+        return float(rate), snr, ""
     except (ValueError, RuntimeError, np.linalg.LinAlgError):
-        return float("nan")
+        return nan, nan, "estimator exception"
 
 
 def _run_sliding(dataset: CSIDataset, output_dir: str, methods: list,
@@ -1765,8 +1782,28 @@ def _run_sliding(dataset: CSIDataset, output_dir: str, methods: list,
     print(f"  [sliding] {len(spans)} segment(s); "
           f"window={window_s}s stride={stride_s}s; methods={methods}")
 
-    per_method_times = {m: [] for m in methods}
-    per_method_rates = {m: [] for m in methods}
+    # One record per window; each holds timing/quality diagnostics plus the
+    # per-method rate + SNR. Drives both the PNG and the CSV.
+    records = []
+
+    def _record(seg_i: int, win: CSIDataset, win_i: int, is_full: bool):
+        f0 = win.frames[0].local_timestamp
+        f1 = win.frames[-1].local_timestamp
+        rec = {
+            "segment": seg_i,
+            "window": win_i,
+            "t_start_s": (f0 - t0_us) / 1e6,
+            "t_center_s": ((f0 + f1) / 2.0 - t0_us) / 1e6,
+            "t_end_s": (f1 - t0_us) / 1e6,
+            "n_frames": win.num_frames,
+            "fs_hz": win.estimated_fs,
+            "is_full_window": int(is_full),
+        }
+        for m in methods:
+            rate, snr, _ = _estimate_rate_for_window(win, m)
+            rec[f"{m}_bpm"] = rate
+            rec[f"{m}_snr"] = snr
+        records.append(rec)
 
     for span_i, (start, end) in enumerate(spans):
         seg = dataset.slice(start, end)
@@ -1775,48 +1812,31 @@ def _run_sliding(dataset: CSIDataset, output_dir: str, methods: list,
             continue
         seg_duration = seg.duration_s
         if seg_duration < window_s:
-            # Still run the whole segment as one window so short segments
-            # aren't lost entirely.
-            t_center = (
-                seg.frames[0].local_timestamp
-                + (seg.frames[-1].local_timestamp - seg.frames[0].local_timestamp) / 2.0
-            )
-            t_center_s = (t_center - t0_us) / 1e6
-            for m in methods:
-                rate = _estimate_rate_for_window(seg, m)
-                per_method_times[m].append(t_center_s)
-                per_method_rates[m].append(rate)
+            # Short segment: run the whole thing as one window so it isn't lost
+            # entirely, but flag is_full_window=0 — it is below the requested
+            # window width and its rate is correspondingly less trustworthy.
+            _record(span_i, seg, 0, False)
             continue
 
         n_window = int(round(window_s * fs_est))
         n_stride = max(1, int(round(stride_s * fs_est)))
-        for i in range(0, seg.num_frames - n_window + 1, n_stride):
-            win = seg.slice(i, i + n_window)
-            t_center_us = (
-                win.frames[0].local_timestamp
-                + (win.frames[-1].local_timestamp - win.frames[0].local_timestamp) / 2.0
-            )
-            t_center_s = (t_center_us - t0_us) / 1e6
-            for m in methods:
-                rate = _estimate_rate_for_window(win, m)
-                per_method_times[m].append(t_center_s)
-                per_method_rates[m].append(rate)
+        for win_i, i in enumerate(
+            range(0, seg.num_frames - n_window + 1, n_stride)
+        ):
+            _record(span_i, seg.slice(i, i + n_window), win_i, True)
 
         print(f"  [sliding] segment {span_i}: {seg.num_frames} frames, "
               f"{seg_duration:.1f}s")
 
     fig, ax = plt.subplots(figsize=(14, 5))
     colors = {"ratio": "tab:blue", "amplitude": "tab:orange", "phase": "tab:green"}
-    any_points = False
-    for m in methods:
-        ts = np.array(per_method_times[m])
-        rs = np.array(per_method_rates[m])
-        if len(ts) == 0:
-            continue
-        any_points = True
-        ax.plot(ts / 3600.0, rs, ".-", label=m, color=colors.get(m),
-                markersize=3, linewidth=1)
+    any_points = bool(records)
     if any_points:
+        ts = np.array([r["t_center_s"] for r in records]) / 3600.0
+        for m in methods:
+            rs = np.array([r[f"{m}_bpm"] for r in records])
+            ax.plot(ts, rs, ".-", label=m, color=colors.get(m),
+                    markersize=3, linewidth=1)
         for gap_idx in dataset.gap_indices:
             if 0 < gap_idx < dataset.num_frames:
                 t_gap = (dataset.frames[gap_idx].local_timestamp - t0_us) / 1e6 / 3600.0
@@ -1837,6 +1857,43 @@ def _run_sliding(dataset: CSIDataset, output_dir: str, methods: list,
     else:
         plt.close(fig)
         print("  [sliding] no windows produced a valid rate estimate.")
+
+    if records:
+        _write_sliding_csv(output_dir, methods, records)
+
+
+def _write_sliding_csv(output_dir: str, methods: list, records: list) -> None:
+    """Write the per-window sliding records to `sliding_breathing.csv`.
+
+    Wide layout, Excel-chart-ready: the time column and the per-method BPM
+    columns come first, so selecting them and inserting a chart reproduces the
+    PNG trace with no pivoting. Diagnostics (`n_frames`, `fs_hz`,
+    `is_full_window`, per-method SNR) follow — use them to filter or
+    conditional-format the windows whose rate should not be trusted. NaN is
+    written as an empty cell so Excel treats it as a gap, not zero."""
+    import csv
+
+    cols = (["t_center_hours"]
+            + [f"{m}_bpm" for m in methods]
+            + ["segment", "window", "t_start_s", "t_center_s", "t_end_s",
+               "n_frames", "fs_hz", "is_full_window"]
+            + [f"{m}_snr" for m in methods])
+
+    def _cell(v, ndigits=2):
+        if isinstance(v, float):
+            if not np.isfinite(v):
+                return ""
+            return round(v, ndigits)
+        return v
+
+    csv_path = os.path.join(output_dir, "sliding_breathing.csv")
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(cols)
+        for r in records:
+            row = {**r, "t_center_hours": r["t_center_s"] / 3600.0}
+            writer.writerow([_cell(row[c]) for c in cols])
+    print(f"  [sliding] wrote {csv_path} ({len(records)} window(s))")
 
 
 def main():
