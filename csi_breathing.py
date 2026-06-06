@@ -69,6 +69,30 @@ BREATH_FREQ_HI = 0.5  # 30 BPM upper bound
 BOI_FREQ_LO = 0.15
 BOI_FREQ_HI = 0.5
 
+# Per-epoch confidence model (sliding-window mode).
+# Each sliding window ("epoch") emits a single consensus breathing rate plus a
+# confidence in [0, 1] so downstream code can discard garbage epochs instead of
+# treating every window's rate as equally trustworthy.  Confidence is the
+# product of three factors, each in [0, 1]:
+#   - spectral prominence: the best per-method PSD peak/median SNR, mapped
+#     through snr/(snr + SLIDING_SNR_HALF).  SLIDING_SNR_HALF is the SNR that
+#     yields 0.5.  Clean breathing peaks sit well above the in-band median
+#     (SNR ~ 5–20); noise peaks hover near 1–2.
+#   - cross-method agreement: 1 - spread/SLIDING_AGREE_TOL_BPM, where spread is
+#     the BPM range across methods that produced a finite rate.  Methods that
+#     independently converge on the same rate corroborate it; a wide spread
+#     means at least one is locking onto a noise peak.
+#   - window coverage: full windows score 1.0, short/partial windows are scaled
+#     by SLIDING_PARTIAL_WINDOW_CONF because their spectral resolution is worse.
+# A single corroborating method caps agreement at SLIDING_SINGLE_METHOD_CONF
+# (one method cannot corroborate itself).  Epochs below SLIDING_CONF_MIN are
+# flagged good=0 — the "ignore this garbage" signal.
+SLIDING_SNR_HALF = 4.0
+SLIDING_AGREE_TOL_BPM = 4.0
+SLIDING_PARTIAL_WINDOW_CONF = 0.5
+SLIDING_SINGLE_METHOD_CONF = 0.5
+SLIDING_CONF_MIN = 0.5
+
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -1759,15 +1783,72 @@ def _estimate_rate_for_window(dataset: CSIDataset, method: str) -> tuple:
         return nan, nan, "estimator exception"
 
 
+def _epoch_rr_confidence(rec: dict, methods: list) -> tuple:
+    """Collapse a window's per-method (rate, SNR) into one epoch RR + confidence.
+
+    Returns ``(rr_bpm, confidence)``. ``rr_bpm`` is the SNR-weighted mean of the
+    methods that produced a finite rate (NaN if none did). ``confidence`` is in
+    [0, 1] — see the SLIDING_* constants for the model. Epochs whose confidence
+    falls below ``SLIDING_CONF_MIN`` are garbage that callers should ignore."""
+    nan = float("nan")
+    rates, snrs = [], []
+    for m in methods:
+        r = rec.get(f"{m}_bpm", nan)
+        s = rec.get(f"{m}_snr", nan)
+        if isinstance(r, float) and np.isfinite(r):
+            rates.append(r)
+            # A finite rate with a non-finite SNR still counts toward the
+            # consensus, just with zero spectral weight.
+            snrs.append(s if (isinstance(s, float) and np.isfinite(s)) else 0.0)
+    if not rates:
+        return nan, 0.0
+
+    rates_a = np.asarray(rates, dtype=float)
+    weights = np.clip(np.asarray(snrs, dtype=float), 0.0, None)
+    if weights.sum() > 0:
+        rr = float(np.average(rates_a, weights=weights))
+    else:
+        rr = float(np.mean(rates_a))
+
+    # Spectral prominence: reward the single most prominent peak across methods.
+    best_snr = float(np.max(weights)) if weights.size else 0.0
+    snr_conf = best_snr / (best_snr + SLIDING_SNR_HALF)
+
+    # Cross-method agreement. Use the SNR-weighted mean absolute deviation of
+    # the per-method rates about the consensus rather than the raw min/max
+    # range: a low-SNR method picking a noise peak then contributes little, so
+    # one strong, correct estimate is not vetoed by weaker disagreeing ones.
+    # When all SNRs are zero/non-finite, fall back to the unweighted spread.
+    if len(rates) >= 2:
+        if weights.sum() > 0:
+            dev = float(np.average(np.abs(rates_a - rr), weights=weights))
+        else:
+            dev = float(np.max(rates_a) - np.min(rates_a))
+        agree_conf = max(0.0, 1.0 - dev / SLIDING_AGREE_TOL_BPM)
+    else:
+        agree_conf = SLIDING_SINGLE_METHOD_CONF
+
+    # Window coverage.
+    cover_conf = 1.0 if rec.get("is_full_window") else SLIDING_PARTIAL_WINDOW_CONF
+
+    confidence = float(np.clip(snr_conf * agree_conf * cover_conf, 0.0, 1.0))
+    return rr, confidence
+
+
 def _run_sliding(dataset: CSIDataset, output_dir: str, methods: list,
                  window_s: float, stride_s: float) -> None:
     """Overnight breathing-rate vs time plot.
 
     Segments the recording on `CSI_GAP` markers from capture.py, then runs
     the per-method estimator on sliding windows (window_s wide, stride_s
-    apart) inside each segment. Produces `<output_dir>/sliding_breathing.png`
-    — the actual sleep-quality signal: breathing rate trajectory through the
-    night, with blank bands at dropouts instead of smoothed bridges.
+    apart) inside each segment. Each window ("epoch") collapses its per-method
+    estimates into a single consensus `rr_bpm` and a `confidence` in [0, 1]
+    (see `_epoch_rr_confidence`); epochs below `SLIDING_CONF_MIN` are flagged
+    `good=0` so garbage windows can be ignored downstream. Produces
+    `<output_dir>/sliding_breathing.png` (epoch RR colored by confidence) and
+    `sliding_breathing.csv` — the actual sleep-quality signal: breathing rate
+    trajectory through the night, with blank bands at dropouts instead of
+    smoothed bridges.
     """
     import matplotlib.pyplot as plt
 
@@ -1803,6 +1884,10 @@ def _run_sliding(dataset: CSIDataset, output_dir: str, methods: list,
             rate, snr, _ = _estimate_rate_for_window(win, m)
             rec[f"{m}_bpm"] = rate
             rec[f"{m}_snr"] = snr
+        rr, conf = _epoch_rr_confidence(rec, methods)
+        rec["rr_bpm"] = rr
+        rec["confidence"] = conf
+        rec["good"] = int(conf >= SLIDING_CONF_MIN and np.isfinite(rr))
         records.append(rec)
 
     for span_i, (start, end) in enumerate(spans):
@@ -1833,10 +1918,24 @@ def _run_sliding(dataset: CSIDataset, output_dir: str, methods: list,
     any_points = bool(records)
     if any_points:
         ts = np.array([r["t_center_s"] for r in records]) / 3600.0
+        # Faint per-method traces for context/debugging.
         for m in methods:
             rs = np.array([r[f"{m}_bpm"] for r in records])
-            ax.plot(ts, rs, ".-", label=m, color=colors.get(m),
-                    markersize=3, linewidth=1)
+            ax.plot(ts, rs, "-", color=colors.get(m), alpha=0.25,
+                    linewidth=0.8, label=f"{m} (raw)")
+        # The actual product: one consensus RR per epoch, colored by confidence.
+        rr = np.array([r["rr_bpm"] for r in records])
+        conf = np.array([r["confidence"] for r in records])
+        finite = np.isfinite(rr)
+        sc = ax.scatter(
+            ts[finite], rr[finite], c=conf[finite], cmap="viridis",
+            vmin=0.0, vmax=1.0, s=18, zorder=5, edgecolors="none",
+            label="epoch RR",
+        )
+        cbar = fig.colorbar(sc, ax=ax, pad=0.01)
+        cbar.set_label("confidence")
+        cbar.ax.axhline(SLIDING_CONF_MIN, color="red", linewidth=1)
+        n_good = int(sum(r["good"] for r in records))
         for gap_idx in dataset.gap_indices:
             if 0 < gap_idx < dataset.num_frames:
                 t_gap = (dataset.frames[gap_idx].local_timestamp - t0_us) / 1e6 / 3600.0
@@ -1846,6 +1945,7 @@ def _run_sliding(dataset: CSIDataset, output_dir: str, methods: list,
         ax.set_ylim(BREATH_FREQ_LO * 60 - 2, BREATH_FREQ_HI * 60 + 2)
         ax.set_title(f"Breathing rate vs time  "
                      f"(window={window_s:.0f}s, stride={stride_s:.0f}s, "
+                     f"{n_good}/{len(records)} epochs conf≥{SLIDING_CONF_MIN}, "
                      f"{len(dataset.gap_indices)} gaps)")
         ax.grid(True, alpha=0.3)
         ax.legend()
@@ -1865,15 +1965,16 @@ def _run_sliding(dataset: CSIDataset, output_dir: str, methods: list,
 def _write_sliding_csv(output_dir: str, methods: list, records: list) -> None:
     """Write the per-window sliding records to `sliding_breathing.csv`.
 
-    Wide layout, Excel-chart-ready: the time column and the per-method BPM
-    columns come first, so selecting them and inserting a chart reproduces the
-    PNG trace with no pivoting. Diagnostics (`n_frames`, `fs_hz`,
+    Wide layout, Excel-chart-ready: time, the consensus `rr_bpm`, its
+    `confidence` in [0,1], and the `good` flag come first, then the per-method
+    BPM columns. Charting `t_center_hours` vs `rr_bpm` filtered on `good=1`
+    reproduces the trusted trace from the PNG. Diagnostics (`n_frames`, `fs_hz`,
     `is_full_window`, per-method SNR) follow — use them to filter or
     conditional-format the windows whose rate should not be trusted. NaN is
     written as an empty cell so Excel treats it as a gap, not zero."""
     import csv
 
-    cols = (["t_center_hours"]
+    cols = (["t_center_hours", "rr_bpm", "confidence", "good"]
             + [f"{m}_bpm" for m in methods]
             + ["segment", "window", "t_start_s", "t_center_s", "t_end_s",
                "n_frames", "fs_hz", "is_full_window"]
