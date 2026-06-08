@@ -1,0 +1,5 @@
+## IDF Component Manager Manifest File
+dependencies:
+  idf: ">=4.4.1"
+  # mDNS was moved out of the IDF core into a managed component (IDF 5.x+).
+  espressif/mdns: "^1.2.0"

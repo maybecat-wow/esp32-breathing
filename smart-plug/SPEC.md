@@ -26,10 +26,10 @@ analogue of `../docs/superpowers/specs/2026-05-14-binary-csi-protocol-design.md`
 - **Target chips.** Classic ESP32 (`esp32-wroom`) and ESP32-S3, matching the
   chip support of the CSI firmware in this repo.
 - **ESP-IDF.** v6.0 (same toolchain as the CSI firmware:
-  `source ~/.espressif/tools/activate_idf_v6.0.sh`). Only IDF-bundled
-  components are used (`esp_http_server`, `mdns`, `json`/cJSON, `esp_wifi`,
-  `nvs_flash`, `esp_timer`, `driver`), so `idf_component.yml` needs no third
-  party entries.
+  `source ~/.espressif/tools/activate_idf_v6.0.sh`). Components used:
+  `esp_http_server`, `json`/cJSON, `esp_wifi`, `esp_netif`, `esp_event`,
+  `nvs_flash`, `esp_timer`, `driver` (all bundled), plus the managed
+  `espressif/mdns` component (extracted from the IDF core in 5.x+).
 - **Out of scope.** The CSI breathing pipeline (this is an independent
   firmware), in-app Wi-Fi provisioning (handled via the official Espressif
   EspTouch app — see §7), and any persistence of relay state (forbidden by
@@ -40,30 +40,28 @@ analogue of `../docs/superpowers/specs/2026-05-14-binary-csi-protocol-design.md`
 
 ---
 
-## 2. Planned source tree
-
-This task delivers only this `SPEC.md`. The source files below are specified
-here for a later implementation pass — they are **not** created yet.
+## 2. Source tree
 
 ```
 esp32-breathing/smart-plug/
 ├── CMakeLists.txt              # top-level IDF project (project(mecha_smart_plug))
 ├── sdkconfig.defaults          # see §9
 ├── main/
-│   ├── app_main.c              # NVS + Wi-Fi/provisioning + bring-up of all tasks
+│   ├── app_main.c              # bring-up: NVS → relay → identity → wifi → mdns → http
 │   ├── plug_relay.c / .h       # GPIO drive + fail-closed watchdog (safety core)
-│   ├── plug_http.c / .h        # esp_http_server URI handlers + JSON
+│   ├── plug_http.c / .h        # esp_http_server URI handlers + cJSON
 │   ├── plug_mdns.c / .h        # mDNS advertise + TXT records
-│   ├── plug_identity.c / .h    # id (MAC suffix), name (NVS), fw version
+│   ├── plug_identity.c / .h    # id (MAC suffix), name (NVS), fw version, hw
+│   ├── plug_wifi.c / .h        # STA + NVS creds + ESPTouch (lifted from CSI fw)
 │   ├── Kconfig.projbuild       # menuconfig options (§4)
-│   ├── CMakeLists.txt          # idf_component_register(SRCS ... )
-│   └── idf_component.yml       # dependencies: idf: ">=4.4.1"
+│   ├── CMakeLists.txt          # idf_component_register(SRCS ... REQUIRES ...)
+│   └── idf_component.yml       # dependencies: idf + espressif/mdns
 └── SPEC.md                     # this file
 ```
 
-`esp_http_server`, `mdns`, and `json` ship inside ESP-IDF, so the only
-`idf_component.yml` dependency is the IDF version pin, exactly like the CSI
-firmware's `main/idf_component.yml`.
+`esp_http_server` and `json` (cJSON) ship inside ESP-IDF. **mDNS** was extracted
+from the IDF core into a managed component in IDF 5.x+, so it is pulled in via
+`idf_component.yml` (`espressif/mdns`). No other third-party dependencies.
 
 ---
 
