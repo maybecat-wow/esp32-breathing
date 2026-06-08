@@ -14,7 +14,7 @@ idf_component_register(
         nvs_flash
         esp_http_server
         esp_timer
-        json
-        driver
+        cjson
+        esp_driver_gpio
         mdns
 )
