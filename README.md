@@ -4,6 +4,8 @@ Contactless breathing rate detection using Wi-Fi Channel State Information (CSI)
 
 The firmware pings the router at 100 Hz and captures the resulting CSI frames, which encode how the wireless channel changes over time. Chest movement during breathing produces subtle, periodic perturbations in the channel — this project extracts that signal and estimates breathing rate in breaths per minute (BPM).
 
+> **This repo also contains a second, independent firmware:** a Wi-Fi **smart plug** under [`smart-plug/`](smart-plug/) that controls a mains relay over a LAN HTTP + mDNS API and is driven by the Mecha Flutter app. See [Smart Plug firmware](#smart-plug-firmware) below and [`smart-plug/SPEC.md`](smart-plug/SPEC.md) for the full contract.
+
 ### Firmware architecture
 
 ```
@@ -232,20 +234,25 @@ Wi-Fi power save (`WIFI_PS_NONE`) and STA inactive time (30 s beacon-loss watchd
 ```
 esp32-breathing/
 ├── main/
-│   ├── app_main.c            # ESP32 firmware: Wi-Fi, CSI capture, TCP streaming
+│   ├── app_main.c            # CSI firmware: Wi-Fi, CSI capture, TCP streaming
+│   ├── csi_protocol.h        # ESP32 mirror of the wire format
 │   ├── Kconfig.projbuild     # menuconfig options (host IP, port, ping rate)
 │   ├── CMakeLists.txt
 │   └── idf_component.yml     # IDF component manager manifest
 ├── capture.py                # Host TCP server — writes raw binary stream to .bin
 ├── csi_protocol.py           # Python wire-format source of truth
 ├── csi_breathing.py          # Offline analysis — breathing rate estimation + plots
-├── main/csi_protocol.h       # ESP32 mirror of the wire format
 ├── tests/                    # pytest suite for protocol + loader
 │   ├── test_binary_protocol.py
 │   ├── test_binary_loader.py
 │   └── test_capture_pipe.py
-├── CMakeLists.txt            # Top-level IDF project CMake file
+├── CMakeLists.txt            # Top-level IDF project CMake file (CSI firmware)
 ├── sdkconfig.defaults        # Non-interactive IDF config overrides
+├── smart-plug/               # Independent smart-plug firmware (see section above)
+│   ├── main/                 # app_main + plug_relay / plug_http / plug_mdns / plug_wifi / plug_identity
+│   ├── SPEC.md               # authoritative HTTP + mDNS contract
+│   ├── CMakeLists.txt
+│   └── sdkconfig.defaults
 └── CLAUDE.md                 # AI assistant context for this repo
 ```
 
@@ -277,6 +284,51 @@ esp32-breathing/
 
 **`PyWavelets not installed` warning**
 - The DWT filter path is disabled but everything else works. Install with `pip install PyWavelets` to enable it.
+
+---
+
+## Smart Plug firmware
+
+A separate ESP-IDF firmware under [`smart-plug/`](smart-plug/) turns an ESP32 into a LAN-controlled mains smart plug. It is unrelated to the CSI pipeline above — it shares only the repo and the ESPTouch/NVS Wi-Fi provisioning approach. It implements the exact HTTP + mDNS contract the Mecha Flutter app's Plug subsystem speaks; the authoritative spec is [`smart-plug/SPEC.md`](smart-plug/SPEC.md).
+
+### What it does
+
+- Advertises itself on mDNS as `_mechaplug._tcp` with TXT records `id` (MAC suffix), `name`, and `fw`, so the app can discover it automatically.
+- Serves a small JSON REST API for the app to read state and toggle the relay.
+- Drives a relay through **one GPIO pin set in menuconfig**, via a low-current signal relay → contactor chain (3.3 V logic is galvanically isolated from mains — the GPIO never switches mains directly).
+- **Fails closed:** the relay boots OFF, is never persisted to NVS, and a watchdog forces it OFF if no command arrives within `CONFIG_PLUG_WATCHDOG_S` (default 30 s). The app sends a heartbeat every 10 s to hold it on.
+
+### HTTP endpoints
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/` | Info — `id`, `name`, `fw_ver`, `on`, `uptime_s`, `rssi`, `hw` |
+| `GET` | `/state` | Live state — `on`, `uptime_s`, `rssi`, `last_cmd_age_ms`, `watchdog_remaining_ms` |
+| `POST` | `/relay` | Body `{"on":true}` → atomic toggle; response `on` is read back from the GPIO. `422` on bad input; relay/watchdog unchanged on any non-2xx |
+| `POST` | `/heartbeat` | Reset the watchdog only (never changes relay state); empty body |
+
+### Build and flash
+
+```sh
+source ~/.espressif/tools/activate_idf_v6.0.sh
+cd smart-plug
+idf.py set-target esp32     # or esp32s3
+idf.py build flash monitor
+```
+
+The component manager pulls in `espressif/mdns` and `espressif/cjson` on first build. Wi-Fi provisioning is identical to the CSI firmware: first boot enters ESPTouch, credentials are stored in NVS and reused.
+
+### Menuconfig options
+
+Under **Mecha Smart Plug** (`idf.py menuconfig`, defined in `smart-plug/main/Kconfig.projbuild`):
+
+| Symbol | Default | Description |
+|--------|---------|-------------|
+| `CONFIG_PLUG_RELAY_GPIO` | `21` | GPIO pin driving the relay signal |
+| `CONFIG_PLUG_RELAY_ACTIVE_HIGH` | `y` | Relay drive polarity (off level is always de-energised) |
+| `CONFIG_PLUG_HTTP_PORT` | `80` | REST API port (also advertised via mDNS SRV) |
+| `CONFIG_PLUG_NAME` | `"Mecha Plug"` | Initial plug name (persisted to NVS) |
+| `CONFIG_PLUG_WATCHDOG_S` | `30` | Fail-closed watchdog window; must match the app's `WATCHDOG_S` |
 
 ---
 

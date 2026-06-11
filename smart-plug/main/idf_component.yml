@@ -1,0 +1,7 @@
+## IDF Component Manager Manifest File
+dependencies:
+  idf: ">=4.4.1"
+  # mDNS and cJSON were moved out of the IDF core into managed components
+  # (IDF 5.x / 6.x). Pull them in here.
+  espressif/mdns: "^1.2.0"
+  espressif/cjson: "^1.7.18"

@@ -1,0 +1,47 @@
+menu "Mecha Smart Plug"
+
+    config PLUG_RELAY_GPIO
+        int "Relay control GPIO pin"
+        default 21
+        range 0 48
+        help
+            GPIO pin that drives the low-current signal-relay coil (see the
+            hardware topology / V54 in SPEC.md). 21 is a safe default on both
+            ESP32 and ESP32-S3. Avoid input-only pins (ESP32 GPIO 34-39),
+            strapping pins (ESP32 0/2/12/15; S3 0/3/45/46), and any pin wired
+            to flash/PSRAM. Range 0-48 covers ESP32 (0-39) and ESP32-S3 (0-48).
+
+    config PLUG_RELAY_ACTIVE_HIGH
+        bool "Relay is active-high"
+        default y
+        help
+            y: GPIO HIGH energises the relay (ON), LOW de-energises (OFF).
+            n: inverted, for boards with an active-low relay driver. The
+            fail-closed OFF level is always the de-energised level, whichever
+            polarity this selects.
+
+    config PLUG_HTTP_PORT
+        int "HTTP server port"
+        default 80
+        range 1 65535
+        help
+            Port for the REST API. The app discovers this via the mDNS SRV
+            record, so non-default ports work, but 80 matches FIRMWARE.md.
+
+    config PLUG_NAME
+        string "Initial plug name"
+        default "Mecha Plug"
+        help
+            Seed value for the `name` mDNS TXT record and the JSON `name`
+            field on first boot. Persisted to NVS thereafter.
+
+    config PLUG_WATCHDOG_S
+        int "Fail-closed watchdog (seconds)"
+        default 30
+        range 5 600
+        help
+            If no POST /relay or POST /heartbeat arrives within this window,
+            the relay is forced OFF (V50). Must match the app's WATCHDOG_S
+            (30 s); changing it changes the safety margin the app assumes.
+
+endmenu
