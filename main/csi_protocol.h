@@ -20,6 +20,7 @@
 #define MSG_SESSION_INFO  0x01
 #define MSG_CSI_FRAME     0x02
 #define MSG_HEARTBEAT     0x03
+#define MSG_ENV           0x04
 
 #define MAX_PAYLOAD_BYTES 4096
 
@@ -68,3 +69,17 @@ typedef struct __attribute__((packed)) {
     uint8_t  last_disc_reason;
 } csi_heartbeat_t;
 _Static_assert(sizeof(csi_heartbeat_t) == 19, "csi_heartbeat_t size drift");
+
+/* ENV payload (22 bytes). Low-rate wired-sensor reading: light + temp/RH.
+ * Own message type so the 100 Hz CSI_FRAME path is never widened. */
+typedef struct __attribute__((packed)) {
+    uint64_t esp_time_us;     /* esp_timer_get_time() at read              */
+    uint32_t seq;             /* env sample counter                        */
+    uint16_t ldr_raw;         /* ADC1 raw 0..4095 (12-bit)                 */
+    uint16_t ldr_mv;          /* calibrated millivolts, 0 if uncalibrated  */
+    int16_t  temp_c_x10;      /* AM2302 deg C * 10, signed (-400..800)     */
+    uint16_t rh_x10;          /* AM2302 %RH * 10 (0..1000)                 */
+    uint8_t  am2302_status;   /* 0=ok 1=crc_fail 2=timeout 3=not_present   */
+    uint8_t  reserved;        /* pad -> 22                                 */
+} csi_env_t;
+_Static_assert(sizeof(csi_env_t) == 22, "csi_env_t size drift");

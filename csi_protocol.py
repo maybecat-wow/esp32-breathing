@@ -15,6 +15,7 @@ from collections import namedtuple
 MSG_SESSION_INFO = 0x01
 MSG_CSI_FRAME    = 0x02
 MSG_HEARTBEAT    = 0x03
+MSG_ENV          = 0x04
 
 # ── Limits ─────────────────────────────────────────────────────────────────
 MAX_PAYLOAD_BYTES = 4096   # host parser closes the socket if length exceeds this
@@ -63,6 +64,19 @@ CSI_FRAME_META = struct.Struct("<IIbbBBH")
 # Sent at 1 Hz when no CSI has gone out for ≥1 s.
 HEARTBEAT = struct.Struct("<QbBIIB")
 
+# Low-rate wired-sensor reading (light + temp/RH). Own message type so the
+# 100 Hz CSI_FRAME path is never widened. Fixed 22-byte payload, no `len`
+# field — the type implies the size.
+#   esp_time_us   : esp_timer_get_time() at read (env clock base)
+#   seq           : env sample counter
+#   ldr_raw       : ADC1 raw 0..4095 (12-bit)
+#   ldr_mv        : calibrated millivolts, 0 if uncalibrated
+#   temp_c_x10    : AM2302 °C ×10, signed (-400..800)
+#   rh_x10        : AM2302 %RH ×10 (0..1000)
+#   am2302_status : 0=ok 1=crc_fail 2=timeout 3=not_present
+#   reserved      : pad → 22
+ENV = struct.Struct("<QIHHhHBB")
+
 
 def pack_header(msg_type: int, length: int) -> bytes:
     """Build the 3-byte message header. Raises ValueError on length > u16."""
@@ -110,6 +124,10 @@ CsiFrameMeta = namedtuple(
 HeartbeatPayload = namedtuple(
     "HeartbeatPayload",
     "esp_time_us rssi channel uptime_s reconnect_count last_disc_reason",
+)
+EnvSample = namedtuple(
+    "EnvSample",
+    "esp_time_us seq ldr_raw ldr_mv temp_c_x10 rh_x10 am2302_status reserved",
 )
 
 
@@ -161,3 +179,14 @@ def encode_heartbeat(*, esp_time_us, rssi, channel, uptime_s,
 
 def decode_heartbeat(payload: bytes) -> HeartbeatPayload:
     return HeartbeatPayload._make(HEARTBEAT.unpack(payload))
+
+
+def encode_env(*, esp_time_us, seq, ldr_raw, ldr_mv, temp_c_x10, rh_x10,
+               am2302_status, reserved=0):
+    body = ENV.pack(esp_time_us, seq, ldr_raw, ldr_mv, temp_c_x10, rh_x10,
+                    am2302_status, reserved)
+    return _wrap(MSG_ENV, body)
+
+
+def decode_env(payload: bytes) -> EnvSample:
+    return EnvSample._make(ENV.unpack(payload))

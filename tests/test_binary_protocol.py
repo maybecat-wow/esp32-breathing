@@ -8,6 +8,7 @@ def test_msg_type_constants():
     assert p.MSG_SESSION_INFO == 0x01
     assert p.MSG_CSI_FRAME == 0x02
     assert p.MSG_HEARTBEAT == 0x03
+    assert p.MSG_ENV == 0x04
 
 
 def test_header_struct_size():
@@ -31,6 +32,12 @@ def test_heartbeat_struct_size():
     # u64 esp_time_us, i8 rssi, u8 channel, u32 uptime_s,
     # u32 reconnect_count, u8 last_disc_reason
     assert p.HEARTBEAT.size == 19
+
+
+def test_env_struct_size():
+    # u64 esp_time_us, u32 seq, u16 ldr_raw, u16 ldr_mv, i16 temp_c_x10,
+    # u16 rh_x10, u8 am2302_status, u8 reserved  →  fixed 22 bytes (V9)
+    assert p.ENV.size == 22
 
 
 def _sample_session_info(boot_id: int = 0xDEADBEEF) -> bytes:
@@ -97,6 +104,39 @@ def test_round_trip_heartbeat():
     assert hb.rssi == -55
     assert hb.channel == 6
     assert hb.uptime_s == 42
+
+
+def test_round_trip_env():
+    raw = p.encode_env(
+        esp_time_us=3_000_000, seq=9,
+        ldr_raw=2048, ldr_mv=1500,
+        temp_c_x10=235, rh_x10=487,
+        am2302_status=0,
+    )
+    msgs = list(p.iter_messages(raw))
+    assert len(msgs) == 1
+    msg_type, payload = msgs[0]
+    assert msg_type == p.MSG_ENV
+    assert len(payload) == 22
+    env = p.decode_env(payload)
+    assert env.esp_time_us == 3_000_000
+    assert env.seq == 9
+    assert env.ldr_raw == 2048
+    assert env.ldr_mv == 1500
+    assert env.temp_c_x10 == 235
+    assert env.rh_x10 == 487
+    assert env.am2302_status == 0
+
+
+def test_round_trip_env_negative_temp():
+    # Sub-zero temperature must survive the signed i16 field.
+    raw = p.encode_env(
+        esp_time_us=1, seq=0, ldr_raw=0, ldr_mv=0,
+        temp_c_x10=-115, rh_x10=900, am2302_status=1,
+    )
+    env = p.decode_env(list(p.iter_messages(raw))[0][1])
+    assert env.temp_c_x10 == -115
+    assert env.am2302_status == 1
 
 
 def test_iter_messages_mixed_stream():
