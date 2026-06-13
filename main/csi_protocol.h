@@ -22,6 +22,10 @@
 #define MSG_HEARTBEAT     0x03
 #define MSG_ENV           0x04
 
+/* SESSION_INFO.sensor_flags bitmap — which wired env sensors are present. */
+#define SENSOR_FLAG_LDR      (1u << 0)
+#define SENSOR_FLAG_AM2302   (1u << 1)
+
 #define MAX_PAYLOAD_BYTES 4096
 
 /* 3-byte message header. */
@@ -38,7 +42,7 @@ typedef struct __attribute__((packed)) {
     uint16_t csi_bytes;        /* 128 for LLTF 64-subcarrier */
     uint8_t  mac[6];
     uint8_t  channel;
-    uint8_t  reserved;
+    uint8_t  sensor_flags;     /* wired-sensor bitmap: bit0=LDR, bit1=AM2302 */
     uint16_t sample_rate_hz;
     uint32_t boot_id;          /* random per boot; lets host distinguish
                                   reboot from TCP reconnect */

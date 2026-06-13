@@ -68,7 +68,7 @@ message. CSI breathing path untouched.
 | id | status | task | cites |
 |----|--------|------|-------|
 | T1 | x | add `MSG_ENV 0x04` + `csi_env_t` struct both sides; `_Static_assert(sizeof==22)` C; py struct + size test | V1,V2,V9 |
-| T2 | . | SESSION_INFO `reserved`→`sensor_flags` both sides; size stay 26 | V7,V2 |
+| T2 | x | SESSION_INFO `reserved`→`sensor_flags` both sides; size stay 26 | V7,V2 |
 | T3 | . | Kconfig.projbuild `CONFIG_ENV_ENABLE`, `CONFIG_ENV_LDR_ADC1_CHANNEL`, `CONFIG_ENV_AM2302_GPIO`, `CONFIG_ENV_EMIT_HZ` | C7,V3 |
 | T4 | . | LDR read: ADC1 oneshot (+ cal mV if avail) | V3 |
 | T5 | . | AM2302 driver via RMT capture; parse 40-bit frame; checksum | C3,V4,V5 |

@@ -40,8 +40,8 @@ HEADER = struct.Struct("<BH")
 #   csi_bytes      : 128 for LLTF 64-subcarrier × I/Q × 1 B
 #   mac[6]         : station MAC at the time of capture
 #   channel        : primary WiFi channel
-#   reserved       : 0 (padding for u16 alignment in human reading; struct.Struct
-#                    forces unaligned regardless)
+#   sensor_flags   : wired-sensor presence bitmap (bit0=LDR, bit1=AM2302).
+#                    0 when no env sensors compiled in. (Was `reserved`.)
 #   sample_rate_hz : nominal CSI capture rate (CONFIG_SEND_FREQUENCY)
 #   boot_id        : random u32 captured once at ESP32 boot; lets the host tell
 #                    "TCP reconnect" (same boot_id) from "ESP32 rebooted"
@@ -114,7 +114,7 @@ def iter_messages(buf, max_payload=MAX_PAYLOAD_BYTES):
 # byte payload for CSI_FRAME.
 SessionInfo = namedtuple(
     "SessionInfo",
-    "chip_id csi_format csi_bytes mac channel reserved sample_rate_hz "
+    "chip_id csi_format csi_bytes mac channel sensor_flags sample_rate_hz "
     "boot_id esp_time_us",
 )
 CsiFrameMeta = namedtuple(
@@ -136,11 +136,11 @@ def _wrap(msg_type: int, payload: bytes) -> bytes:
 
 
 def encode_session_info(*, chip_id, csi_format, csi_bytes, mac, channel,
-                        sample_rate_hz, boot_id, esp_time_us, reserved=0):
+                        sample_rate_hz, boot_id, esp_time_us, sensor_flags=0):
     if len(mac) != 6:
         raise ValueError("mac must be exactly 6 bytes")
     body = SESSION_INFO.pack(
-        chip_id, csi_format, csi_bytes, mac, channel, reserved,
+        chip_id, csi_format, csi_bytes, mac, channel, sensor_flags,
         sample_rate_hz, boot_id, esp_time_us,
     )
     return _wrap(MSG_SESSION_INFO, body)

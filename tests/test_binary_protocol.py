@@ -18,8 +18,21 @@ def test_header_struct_size():
 
 def test_session_info_struct_size():
     # u8 chip_id, u8 csi_format, u16 csi_bytes, u8 mac[6], u8 channel,
-    # u8 reserved, u16 sample_rate_hz, u32 boot_id, u64 esp_time_us
+    # u8 sensor_flags, u16 sample_rate_hz, u32 boot_id, u64 esp_time_us
+    # Repurposing reserved→sensor_flags must NOT change the 26-byte size (V2).
     assert p.SESSION_INFO.size == 26
+
+
+def test_session_info_sensor_flags_round_trip():
+    raw = p.encode_session_info(
+        chip_id=2, csi_format=0, csi_bytes=128,
+        mac=b"\x11\x22\x33\x44\x55\x66",
+        channel=11, sample_rate_hz=100,
+        boot_id=1, esp_time_us=5,
+        sensor_flags=0b11,   # LDR + AM2302 present
+    )
+    info = p.decode_session_info(list(p.iter_messages(raw))[0][1])
+    assert info.sensor_flags == 0b11
 
 
 def test_csi_frame_meta_struct_size():

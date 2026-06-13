@@ -260,7 +260,7 @@ static void tcp_send_session_info_locked(void)
     info->csi_bytes      = 128;
     memcpy(info->mac, mac, 6);
     info->channel        = channel;
-    info->reserved       = 0;
+    info->sensor_flags   = 0;  /* set from env config in T7 */
     info->sample_rate_hz = (uint16_t)CONFIG_SEND_FREQUENCY;
     info->boot_id        = s_boot_id;
     info->esp_time_us    = (uint64_t)esp_timer_get_time();
