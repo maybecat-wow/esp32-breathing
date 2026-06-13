@@ -174,18 +174,19 @@ Results from all three estimators are printed side-by-side so you can cross-chec
 The ESP32 streams length-prefixed binary messages over TCP. Every message:
 
 ```
-u8  type        // 0x01 SESSION_INFO, 0x02 CSI_FRAME, 0x03 HEARTBEAT
+u8  type        // 0x01 SESSION_INFO, 0x02 CSI_FRAME, 0x03 HEARTBEAT, 0x04 ENV
 u16 length      // payload length (little-endian, NOT including this 3-byte header)
 u8  payload[length]
 ```
 
-All multi-byte integers are little-endian. Three message types:
+All multi-byte integers are little-endian. Four message types:
 
 | Type | Name | When emitted | Payload |
 |------|------|--------------|---------|
-| `0x01` | `SESSION_INFO` | Once per TCP (re)connect, before any other message | chip_id, csi_format, csi_bytes, MAC, channel, sample_rate_hz, `boot_id` (random per boot), esp_time_us — 26 bytes |
+| `0x01` | `SESSION_INFO` | Once per TCP (re)connect, before any other message | chip_id, csi_format, csi_bytes, MAC, channel, `sensor_flags` (bit0=LDR, bit1=AM2302), sample_rate_hz, `boot_id` (random per boot), esp_time_us — 26 bytes |
 | `0x02` | `CSI_FRAME` | Once per CSI capture (~100 Hz) | local_timestamp_us, seq, rssi, noise_floor, rate, first_word_invalid, len, followed by `len` raw CSI bytes — 14 byte meta + 128 byte CSI = 142 bytes |
 | `0x03` | `HEARTBEAT` | 1 Hz idle (no CSI sent for ≥1 s) | esp_time_us, rssi, channel, uptime_s, reconnect_count, last_disc_reason — 19 bytes |
+| `0x04` | `ENV` | Low-rate wired-sensor reading (`CONFIG_ENV_EMIT_HZ`, default 1 Hz) | esp_time_us, seq, ldr_raw, ldr_mv, temp_c_x10, rh_x10, am2302_status — fixed 22 bytes |
 
 The wire format is defined in two places that **MUST stay in sync**:
 
@@ -194,7 +195,49 @@ The wire format is defined in two places that **MUST stay in sync**:
 
 The CSI byte payload is 64 complex subcarriers stored as interleaved `[imag0, real0, imag1, real1, ...]` `int8` pairs. The first two subcarriers (indices 0–1) are hardware artifacts and are masked out during analysis. `local_timestamp_us` is the ESP32's internal microsecond timer (`esp_timer_get_time()`); the host loader unwraps the u32 across the ~71 min boundary into a monotonic 64-bit `logical_us` before resampling.
 
-The host loader (`csi_breathing.load_binary`) walks the binary stream and rebuilds the same `CSIDataset` shape the legacy CSV loader produced, so the downstream DSP pipeline is unchanged.
+The host loader (`csi_breathing.load_binary`) walks the binary stream and rebuilds the same `CSIDataset` shape the legacy CSV loader produced, so the downstream DSP pipeline is unchanged. `MSG_ENV` samples are collected on a separate `CSIDataset.env` list and never mixed into the CSI frames.
+
+---
+
+## Environment Sensors (optional)
+
+Set `CONFIG_ENV_ENABLE=y` to attach a wired light sensor and a temperature/humidity sensor. A dedicated firmware task (`main/env_sensors.c`) samples them and emits one `MSG_ENV` message per `CONFIG_ENV_EMIT_HZ` tick — completely independent of the CSI breathing path.
+
+### Wiring
+
+All sensors run off the ESP32 **3V3** rail and a common **GND** (not 5 V).
+
+**LDR (CdS light) — analog divider into ADC1:**
+
+```
+3V3 ──[ LDR ]──┬──[ R_fix (10k) ]── GND
+               └── ADC1 GPIO  (CONFIG_ENV_LDR_ADC1_CHANNEL)
+```
+
+Must be an **ADC1** channel — ADC2 is unusable while Wi-Fi is on. Classic ESP32: ch0–7 = GPIO36,37,38,39,32,33,34,35. ESP32-S3: ch0–9 = GPIO1–10. The firmware sends raw + calibrated mV; the host derives a rough lux estimate (CdS power-law) that is an estimate only, never authoritative.
+
+**AM2302 / DHT22 (temp/humidity) — 1-wire digital:**
+
+```
+AM2302 DATA ──┬── GPIO  (CONFIG_ENV_AM2302_GPIO)
+              └── R 4.7k–10k ── 3V3   (mandatory pull-up)
+```
+
+Captured via the **RMT** peripheral (not bit-bang) so FreeRTOS jitter can't corrupt the timing-critical 40-bit frame. Read at most once every 2 s (sensor minimum) with last-good caching; the 5-byte checksum is validated and a CRC failure keeps the last good reading and flags `am2302_status`. Pick a normal GPIO — avoid strapping pins and the input-only GPIO34–39 on the classic ESP32.
+
+### Menuconfig options
+
+Under **CSI Breathing Monitor → Environment sensors**:
+
+| Option | Default | Meaning |
+|--------|---------|---------|
+| `CONFIG_ENV_ENABLE` | `n` | Master switch for the env sensors |
+| `CONFIG_ENV_EMIT_HZ` | `1` | MSG_ENV send rate (AM2302 only updates ~0.5 Hz) |
+| `CONFIG_ENV_LDR_ENABLE` | `y` | Enable the LDR |
+| `CONFIG_ENV_LDR_ADC1_CHANNEL` | `6` | ADC1 channel for the LDR node |
+| `CONFIG_ENV_LDR_RFIX_OHM` | `10000` | Divider fixed resistor (keep in sync with `LDR_R_FIX_OHM` in `csi_breathing.py`) |
+| `CONFIG_ENV_AM2302_ENABLE` | `y` | Enable the AM2302 |
+| `CONFIG_ENV_AM2302_GPIO` | `4` | AM2302 DATA GPIO |
 
 ---
 
@@ -234,9 +277,10 @@ Wi-Fi power save (`WIFI_PS_NONE`) and STA inactive time (30 s beacon-loss watchd
 ```
 esp32-breathing/
 ├── main/
-│   ├── app_main.c            # CSI firmware: Wi-Fi, CSI capture, TCP streaming
+│   ├── app_main.c            # CSI firmware: Wi-Fi, CSI capture, TCP streaming, env_task
+│   ├── env_sensors.c/.h      # optional LDR (ADC1) + AM2302 (RMT) sensors → MSG_ENV
 │   ├── csi_protocol.h        # ESP32 mirror of the wire format
-│   ├── Kconfig.projbuild     # menuconfig options (host IP, port, ping rate)
+│   ├── Kconfig.projbuild     # menuconfig options (host IP, port, ping rate, env sensors)
 │   ├── CMakeLists.txt
 │   └── idf_component.yml     # IDF component manager manifest
 ├── capture.py                # Host TCP server — writes raw binary stream to .bin

@@ -71,16 +71,22 @@ ESP32 (app_main.c)
 - **`tcp_send_session_info_locked()`** — emits one `SESSION_INFO` message per (re)connect from the reconnect task while holding `s_tcp_mutex`. Establishes `boot_id` so the host can tell a TCP reconnect from an ESP32 reboot.
 - **`tcp_send_heartbeat_locked()`** — emits a binary `HEARTBEAT` at 1 Hz when no CSI has gone out for ≥1 s.
 - **`wifi_ping_router_start()`** — starts a continuous ping to the gateway at `CONFIG_SEND_FREQUENCY` (100) Hz, which is the traffic source that generates CSI frames.
+- **`env_task()`** (`main/env_sensors.c`, only when `CONFIG_ENV_ENABLE=y`) — samples the wired LDR + AM2302 sensors and emits a low-rate `MSG_ENV`. The (blocking) sensor read happens off `s_tcp_mutex`; the send holds it. Independent of the CSI path.
 
 ### Wire format
 
 The ESP32 streams a sequence of length-prefixed binary messages
-(little-endian, `u8 type | u16 length | payload`). Three message types:
+(little-endian, `u8 type | u16 length | payload`). Four message types:
 SESSION_INFO (sent once per TCP (re)connect), CSI_FRAME (one per CSI
-capture), HEARTBEAT (1 Hz idle). The wire format is defined in
-`csi_protocol.py` and `main/csi_protocol.h`; the two MUST stay in sync —
-the Python side pins struct sizes via unit tests, and the firmware side
-pins them via `_Static_assert`.
+capture), HEARTBEAT (1 Hz idle), ENV (low-rate wired-sensor reading —
+light + temp/humidity; 22-byte fixed payload, see Environment sensors).
+The wire format is defined in `csi_protocol.py` and `main/csi_protocol.h`;
+the two MUST stay in sync — the Python side pins struct sizes via unit
+tests, and the firmware side pins them via `_Static_assert`.
+
+SESSION_INFO carries a `sensor_flags` byte (bit0=LDR, bit1=AM2302) so
+the host knows which env sensors are present. The old `reserved` byte
+was repurposed for this; the struct stays 26 bytes.
 
 Supported chips: classic ESP32 and ESP32-S3, LLTF-only (lltf_en=true,
 htltf_en=false), 64 subcarriers × I/Q = 128 CSI bytes per frame.
@@ -103,6 +109,16 @@ Implements three approaches (default: ratio):
 - **Phase**: phase-difference approach with linear detrending.
 
 Key constants at the top of the file control the breathing frequency band (default 0.1–0.5 Hz / 6–30 BPM), BoI selection, pilot/null subcarrier masking, and Hampel filter parameters for DC removal.
+
+`MSG_ENV` samples land on a separate `CSIDataset.env` list (never in `frames`), exposed via `env_temps_c` / `env_rh` / `env_ldr_raw` / `env_lux` arrays. Temp/RH are decoded once on the wire (×10 ints, host just ÷10); `ldr_lux_estimate()` turns the LDR divider reading into a rough lux value via a CdS power-law — estimate only, never authoritative. Env rides the `esp_timer` clock, not the CSI `rx_ctrl` clock, so align by host wall-clock rather than subtracting timestamps.
+
+### Environment sensors (`main/env_sensors.c`, optional)
+
+Enabled by `CONFIG_ENV_ENABLE`. Wiring + design:
+- **LDR (CdS light)** — divider `3V3 — LDR — node — R_fix(10k) — GND`, node into an **ADC1** channel (`CONFIG_ENV_LDR_ADC1_CHANNEL`). ADC1 is mandatory — ADC2 is dead while Wi-Fi is on. Firmware sends raw + calibrated mV.
+- **AM2302 / DHT22 (temp/RH)** — 1-wire DATA on `CONFIG_ENV_AM2302_GPIO` with a 4.7k–10k pull-up to 3V3. Read via the **RMT** peripheral (not bit-bang) to survive FreeRTOS jitter, at most once per 2 s (sensor minimum) with last-good caching. Firmware validates the 5-byte checksum and emits °C/%RH ×10; on CRC failure it keeps the last good values and sets `am2302_status`.
+
+Menuconfig: *CSI Breathing Monitor → Environment sensors* — `CONFIG_ENV_ENABLE`, `CONFIG_ENV_EMIT_HZ`, `CONFIG_ENV_LDR_*` (incl. `CONFIG_ENV_LDR_RFIX_OHM`, keep in sync with `LDR_R_FIX_OHM` in `csi_breathing.py`), `CONFIG_ENV_AM2302_*`.
 
 ## Component Dependencies
 
