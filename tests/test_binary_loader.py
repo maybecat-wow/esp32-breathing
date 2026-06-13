@@ -175,6 +175,57 @@ def test_length_overflow_stops_walk():
     assert ds.num_frames == 1
 
 
+def _env(seq, *, ldr_raw=2048, ldr_mv=1500, temp_c_x10=235, rh_x10=487,
+         status=0, esp_time_us=None):
+    return p.encode_env(
+        esp_time_us=esp_time_us if esp_time_us is not None else seq * 1_000_000,
+        seq=seq, ldr_raw=ldr_raw, ldr_mv=ldr_mv,
+        temp_c_x10=temp_c_x10, rh_x10=rh_x10, am2302_status=status,
+    )
+
+
+def test_env_stream_separate_from_frames():
+    # Two CSI frames + two env samples interleaved. Env must land on ds.env,
+    # NOT on ds.frames, and must not create gaps (V13).
+    stream = (
+        _session_info()
+        + _csi_frame(10_000, 0)
+        + _env(0)
+        + _csi_frame(20_000, 1)
+        + _env(1)
+    )
+    ds = load_binary_bytes(stream)
+    assert ds.num_frames == 2          # env never counted as a CSI frame
+    assert ds.gap_indices == []
+    assert len(ds.env) == 2
+    assert ds.skipped_rows == 0        # env is known, not "unknown" (V10)
+
+
+def test_env_decode_units_and_validity():
+    stream = (
+        _session_info()
+        + _env(0, temp_c_x10=236, rh_x10=455, status=0)
+        + _env(1, temp_c_x10=-115, rh_x10=900, status=1)   # crc_fail
+    )
+    ds = load_binary_bytes(stream)
+    assert len(ds.env) == 2
+    # Host only divides by 10 (V11).
+    assert ds.env[0].temp_c == 23.6
+    assert ds.env[0].rh == 45.5
+    assert ds.env[0].temp_valid is True
+    assert ds.env[1].temp_valid is False
+    # env_temps_c excludes the crc_fail sample.
+    assert list(ds.env_temps_c) == [23.6]
+    assert list(ds.env_rh) == [45.5]
+
+
+def test_env_lux_estimate_monotonic():
+    # Brighter (lower LDR resistance → higher node voltage) → more lux.
+    bright = load_binary_bytes(_session_info() + _env(0, ldr_mv=2500)).env[0]
+    dark = load_binary_bytes(_session_info() + _env(0, ldr_mv=300)).env[0]
+    assert bright.ldr_lux > dark.ldr_lux > 0.0
+
+
 def test_parse_file_dispatches_to_binary(tmp_path):
     stream = _session_info() + _csi_frame(10_000, 0)
     binpath = tmp_path / "smoke.bin"

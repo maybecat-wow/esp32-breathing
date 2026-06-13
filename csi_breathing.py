@@ -93,6 +93,17 @@ SLIDING_PARTIAL_WINDOW_CONF = 0.5
 SLIDING_SINGLE_METHOD_CONF = 0.5
 SLIDING_CONF_MIN = 0.5
 
+# Env LDR (CdS) → lux estimate. The voltage divider is 3V3 — LDR — node —
+# R_fix — GND, node read by ADC1. These are APPROXIMATE defaults, NOT a
+# calibrated cell — lux is an estimate only and never authoritative (V11).
+LDR_VCC_V = 3.3
+LDR_R_FIX_OHM = 10_000.0     # fixed divider leg; match CONFIG_ENV_LDR_RFIX_OHM
+LDR_ADC_FULL_SCALE = 4095.0  # 12-bit ADC1
+LDR_ADC_FULL_SCALE_V = 3.1   # ~full-scale volts at 12 dB attenuation
+# CdS power-law lux ≈ A * R_ldr(kΩ)^B. Generic GL5528-ish coefficients.
+LDR_LUX_A = 5.0e5
+LDR_LUX_B = -1.4
+
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -131,12 +142,62 @@ class CSIFrame:
     raw_csi: np.ndarray  # complex64 array of subcarrier values, length = csi_len / 2
 
 
+def ldr_resistance_ohm(ldr_raw: int, ldr_mv: int) -> float:
+    """LDR resistance (Ω) from the divider, preferring calibrated mV.
+
+    Divider: 3V3 — LDR — node — R_fix — GND.  V_node = Vcc·R_fix/(R_ldr+R_fix)
+    ⇒ R_ldr = R_fix·(Vcc − V_node)/V_node.  Returns inf in the dark (V→0).
+    """
+    if ldr_mv > 0:
+        v_node = ldr_mv / 1000.0
+    else:
+        v_node = (ldr_raw / LDR_ADC_FULL_SCALE) * LDR_ADC_FULL_SCALE_V
+    if v_node <= 0.0:
+        return float("inf")
+    return LDR_R_FIX_OHM * (LDR_VCC_V - v_node) / v_node
+
+
+def ldr_lux_estimate(ldr_raw: int, ldr_mv: int) -> float:
+    """Rough lux from a CdS cell via power-law. ESTIMATE only (V11)."""
+    r = ldr_resistance_ohm(ldr_raw, ldr_mv)
+    if not np.isfinite(r) or r <= 0.0:
+        return 0.0
+    return float(LDR_LUX_A * (r / 1000.0) ** LDR_LUX_B)
+
+
+@dataclass
+class EnvSample:
+    """One MSG_ENV reading (light + temp/RH). Separate from the CSI frame
+    timeline — env data NEVER feeds the breathing estimator (V13)."""
+
+    esp_time_us: int     # esp_timer clock; NOT the CSI rx_ctrl clock (V12)
+    seq: int
+    ldr_raw: int         # ADC1 raw 0..4095
+    ldr_mv: int          # calibrated millivolts, 0 if uncalibrated
+    temp_c: float        # already host-decoded: temp_c_x10 / 10 (V11)
+    rh: float            # rh_x10 / 10
+    am2302_status: int   # 0=ok 1=crc_fail 2=timeout 3=not_present
+
+    @property
+    def ldr_lux(self) -> float:
+        return ldr_lux_estimate(self.ldr_raw, self.ldr_mv)
+
+    @property
+    def temp_valid(self) -> bool:
+        return self.am2302_status == 0
+
+
 @dataclass
 class CSIDataset:
     """Collection of parsed CSI frames."""
 
     frames: list = field(default_factory=list)
     skipped_rows: int = 0  # lines that failed to parse (malformed/incomplete)
+
+    # MSG_ENV samples, kept on a SEPARATE list from `frames`. Env never
+    # contaminates the CSI breathing pipeline (V13); it rides its own
+    # esp_timer clock and is correlated, not fed in (V12).
+    env: list = field(default_factory=list)
 
     # Frame indices at which a new contiguous segment begins — populated by
     # _parse_csv when it encounters `CSI_GAP` marker rows produced by
@@ -203,6 +264,34 @@ class CSIDataset:
             return 100.0
         # Median is robust to burst gaps and duplicated timestamps
         return 1.0 / np.median(dt)
+
+    # ── Env sensor stream (MSG_ENV) ────────────────────────────────────────
+    # Separate, low-rate series on the esp_timer clock. To overlay env on the
+    # CSI timeline, map both clocks to host wall-clock and interpolate — do
+    # NOT subtract env_times_us from CSI timestamps_us directly (V12).
+    @property
+    def env_times_us(self) -> np.ndarray:
+        return np.array([e.esp_time_us for e in self.env], dtype=np.float64)
+
+    @property
+    def env_temps_c(self) -> np.ndarray:
+        """Temperature (°C) for AM2302-valid samples only."""
+        return np.array([e.temp_c for e in self.env if e.temp_valid],
+                        dtype=np.float64)
+
+    @property
+    def env_rh(self) -> np.ndarray:
+        return np.array([e.rh for e in self.env if e.temp_valid],
+                        dtype=np.float64)
+
+    @property
+    def env_ldr_raw(self) -> np.ndarray:
+        return np.array([e.ldr_raw for e in self.env], dtype=np.float64)
+
+    @property
+    def env_lux(self) -> np.ndarray:
+        """Estimated lux per env sample. Estimate only — never authoritative."""
+        return np.array([e.ldr_lux for e in self.env], dtype=np.float64)
 
     @property
     def rssi(self) -> np.ndarray:
@@ -499,6 +588,25 @@ def load_binary_bytes(stream: bytes) -> CSIDataset:
         if msg_type == _proto.MSG_HEARTBEAT:
             # Heartbeats are informational; could record on dataset later if
             # the analysis ever needs link-health context.
+            continue
+
+        if msg_type == _proto.MSG_ENV:
+            # Env reading: decode-to-units once (÷10), store on the SEPARATE
+            # env list. Never appended to frames — no CSI contamination (V13).
+            try:
+                env = _proto.decode_env(payload)
+            except (struct.error, ValueError):
+                dataset.skipped_rows += 1
+                continue
+            dataset.env.append(EnvSample(
+                esp_time_us=env.esp_time_us,
+                seq=env.seq,
+                ldr_raw=env.ldr_raw,
+                ldr_mv=env.ldr_mv,
+                temp_c=env.temp_c_x10 / 10.0,
+                rh=env.rh_x10 / 10.0,
+                am2302_status=env.am2302_status,
+            ))
             continue
 
         # Unknown type: walker has already advanced past it; just count.
