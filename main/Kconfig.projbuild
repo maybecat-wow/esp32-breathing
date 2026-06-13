@@ -24,4 +24,65 @@ menu "CSI Breathing Monitor"
             Higher values give better time resolution but increase CPU and
             network load. 100 Hz is the recommended default.
 
+    menu "Environment sensors (LDR + AM2302)"
+
+        config ENV_ENABLE
+            bool "Enable wired environment sensors"
+            default n
+            help
+                Master switch for the wired light (LDR/CdS) and
+                temperature/humidity (AM2302/DHT22) sensors. When enabled a
+                dedicated task samples them and emits a low-rate MSG_ENV
+                message to the capture host. Independent of the CSI path.
+
+        config ENV_EMIT_HZ
+            int "Env emit rate (Hz)"
+            depends on ENV_ENABLE
+            default 1
+            range 1 10
+            help
+                How often MSG_ENV is sent. The AM2302 only updates every
+                ~2 s, so values above ~1 Hz just resend cached temp/RH with
+                fresh LDR readings.
+
+        config ENV_LDR_ENABLE
+            bool "Enable LDR (CdS) light sensor"
+            depends on ENV_ENABLE
+            default y
+
+        config ENV_LDR_ADC1_CHANNEL
+            int "LDR ADC1 channel"
+            depends on ENV_LDR_ENABLE
+            default 6
+            range 0 9
+            help
+                ADC1 channel index for the LDR divider node. MUST be ADC1 —
+                ADC2 is unusable while Wi-Fi is active. Classic ESP32: ch0-7
+                = GPIO36,37,38,39,32,33,34,35. ESP32-S3: ch0-9 = GPIO1-10.
+
+        config ENV_LDR_RFIX_OHM
+            int "LDR divider fixed resistor (ohm)"
+            depends on ENV_LDR_ENABLE
+            default 10000
+            help
+                Value of the fixed leg in the 3V3-LDR-node-Rfix-GND divider.
+                Used host-side for the lux estimate; keep in sync there.
+
+        config ENV_AM2302_ENABLE
+            bool "Enable AM2302 (DHT22) temp/humidity sensor"
+            depends on ENV_ENABLE
+            default y
+
+        config ENV_AM2302_GPIO
+            int "AM2302 data GPIO"
+            depends on ENV_AM2302_ENABLE
+            default 4
+            range 0 48
+            help
+                GPIO wired to the AM2302 DATA line (needs a 4.7k-10k pull-up
+                to 3V3). Pick a normal GPIO — avoid strapping pins and the
+                input-only GPIO34-39 on the classic ESP32.
+
+    endmenu
+
 endmenu

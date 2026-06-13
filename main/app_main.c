@@ -74,6 +74,7 @@
 #include "esp_random.h"
 
 #include "csi_protocol.h"
+#include "env_sensors.h"
 
 /* ── Configuration ──────────────────────────────────────────────────────── */
 
@@ -260,7 +261,7 @@ static void tcp_send_session_info_locked(void)
     info->csi_bytes      = 128;
     memcpy(info->mac, mac, 6);
     info->channel        = channel;
-    info->sensor_flags   = 0;  /* set from env config in T7 */
+    info->sensor_flags   = env_sensor_flags();  /* bit0=LDR bit1=AM2302 */
     info->sample_rate_hz = (uint16_t)CONFIG_SEND_FREQUENCY;
     info->boot_id        = s_boot_id;
     info->esp_time_us    = (uint64_t)esp_timer_get_time();
@@ -412,6 +413,47 @@ static void tcp_reconnect_task(void *arg)
         }
     }
 }
+
+#if CONFIG_ENV_ENABLE
+/**
+ * Background task: samples the wired env sensors (LDR + AM2302) and emits one
+ * MSG_ENV message per CONFIG_ENV_EMIT_HZ tick.
+ *
+ * The (potentially blocking, up to ~50 ms for an AM2302 frame) sensor read is
+ * done OUTSIDE s_tcp_mutex so it can never stall the writer task or Wi-Fi path
+ * (V6). The mutex is held only for the send (V8). The AM2302 itself is rate-
+ * limited to one hardware read per 2 s inside env_read(), serving cache in
+ * between (V4); a CRC failure keeps the last good values (V5).
+ */
+static void env_task(void *arg)
+{
+    env_sensors_init();
+
+    int hz = CONFIG_ENV_EMIT_HZ;
+    if (hz < 1) hz = 1;
+    const TickType_t period = pdMS_TO_TICKS(1000 / hz);
+
+    while (true) {
+        csi_env_t env;
+        env_read(&env);   /* off-lock: ADC + (≤ every 2 s) RMT read */
+
+        uint8_t buf[sizeof(csi_msg_header_t) + sizeof(csi_env_t)];
+        csi_msg_header_t *hdr = (csi_msg_header_t *)buf;
+        csi_env_t        *e   = (csi_env_t *)(buf + sizeof(csi_msg_header_t));
+        hdr->type   = MSG_ENV;
+        hdr->length = sizeof(csi_env_t);
+        memcpy(e, &env, sizeof(env));
+
+        xSemaphoreTake(s_tcp_mutex, portMAX_DELAY);
+        if (s_tcp_sock >= 0 && s_session_info_sent) {
+            tcp_send_locked((const char *)buf, sizeof(buf));
+        }
+        xSemaphoreGive(s_tcp_mutex);
+
+        vTaskDelay(period);
+    }
+}
+#endif /* CONFIG_ENV_ENABLE */
 
 /* ── CSI callback ────────────────────────────────────────────────────────── */
 
@@ -847,4 +889,10 @@ void app_main(void)
 
     wifi_csi_init();
     wifi_ping_router_start();
+
+#if CONFIG_ENV_ENABLE
+    /* Wired env sensors (LDR + AM2302) — own task, independent of the CSI
+       path. Sends a low-rate MSG_ENV; sensor reads happen off the TCP mutex. */
+    xTaskCreate(env_task, "env", 4096, NULL, 2, NULL);
+#endif
 }

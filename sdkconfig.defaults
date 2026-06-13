@@ -66,3 +66,11 @@ CONFIG_ESP32_WIFI_MGMT_SBUF_NUM=32
 #
 CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240=y
 CONFIG_ESP32S3_DEFAULT_CPU_FREQ_MHZ=240
+
+#
+# Environment sensors (LDR + AM2302). Pins/channel default in
+# main/Kconfig.projbuild — set them via menuconfig to match your wiring.
+#
+CONFIG_ENV_ENABLE=y
+CONFIG_ENV_LDR_ENABLE=y
+CONFIG_ENV_AM2302_ENABLE=y

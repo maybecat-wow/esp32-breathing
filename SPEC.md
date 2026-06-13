@@ -69,11 +69,11 @@ message. CSI breathing path untouched.
 |----|--------|------|-------|
 | T1 | x | add `MSG_ENV 0x04` + `csi_env_t` struct both sides; `_Static_assert(sizeof==22)` C; py struct + size test | V1,V2,V9 |
 | T2 | x | SESSION_INFO `reserved`→`sensor_flags` both sides; size stay 26 | V7,V2 |
-| T3 | . | Kconfig.projbuild `CONFIG_ENV_ENABLE`, `CONFIG_ENV_LDR_ADC1_CHANNEL`, `CONFIG_ENV_AM2302_GPIO`, `CONFIG_ENV_EMIT_HZ` | C7,V3 |
-| T4 | . | LDR read: ADC1 oneshot (+ cal mV if avail) | V3 |
-| T5 | . | AM2302 driver via RMT capture; parse 40-bit frame; checksum | C3,V4,V5 |
-| T6 | . | `env_task`: read LDR each tick, AM2302 ≥2 s cache, build `csi_env_t`, `tcp_send_env_locked()` at `CONFIG_ENV_EMIT_HZ` | V4,V5,V6,V8 |
-| T7 | . | set `sensor_flags` at session build from enabled CONFIG | V7 |
+| T3 | x | Kconfig.projbuild `CONFIG_ENV_ENABLE`, `CONFIG_ENV_LDR_ADC1_CHANNEL`, `CONFIG_ENV_AM2302_GPIO`, `CONFIG_ENV_EMIT_HZ` | C7,V3 |
+| T4 | x | LDR read: ADC1 oneshot (+ cal mV if avail) | V3 |
+| T5 | x | AM2302 driver via RMT capture; parse 40-bit frame; checksum | C3,V4,V5 |
+| T6 | x | `env_task`: read LDR each tick, AM2302 ≥2 s cache, build `csi_env_t`, `tcp_send_env_locked()` at `CONFIG_ENV_EMIT_HZ` | V4,V5,V6,V8 |
+| T7 | x | set `sensor_flags` at session build from enabled CONFIG | V7 |
 | T8 | x | `capture.py`: decode MSG_ENV, peek into `stats.json` (env_frames, last temp/rh/ldr) | I.capture,V1 |
 | T9 | x | `csi_breathing.load_binary()`: expose env samples alongside CSI | I.loader,V1 |
 | T10 | . | docs: README + CLAUDE.md wire-format + wiring | I.wiring |
