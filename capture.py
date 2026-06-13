@@ -70,6 +70,11 @@ class CaptureSession:
         self.last_stats_mono = 0.0
         self.last_heartbeat_wall = None
 
+        # Env-sensor peek (MSG_ENV). Decode-to-units is done once on the wire
+        # (firmware emits ×10 ints); host only divides by 10 — see V11.
+        self.env_frames = 0
+        self.last_env = None
+
         # Per-session timestamp/wrap state (mirrors loader logic).
         self.session_boot_id = None
         self.prev_raw_us     = None
@@ -131,6 +136,23 @@ class CaptureSession:
         elif msg_type == proto.MSG_HEARTBEAT:
             self.last_heartbeat_wall = _dt.datetime.now(_dt.timezone.utc)
 
+        elif msg_type == proto.MSG_ENV:
+            try:
+                env = proto.decode_env(payload)
+            except (struct.error, ValueError):
+                return
+            self.env_frames += 1
+            self.last_env = {
+                "temp_c": env.temp_c_x10 / 10.0,
+                "rh": env.rh_x10 / 10.0,
+                "ldr_raw": env.ldr_raw,
+                "ldr_mv": env.ldr_mv,
+                "am2302_status": env.am2302_status,
+            }
+
+        # Any other (unknown) type: bytes are already on disk via write_raw;
+        # nothing to peek. Socket stays open — forward-compat (V10).
+
     def _note_gap(self, reason: str, duration_ms: int):
         self.gap_count += 1
         self.total_gap_ms += max(0, int(duration_ms))
@@ -177,6 +199,8 @@ class CaptureSession:
                 self.last_heartbeat_wall.isoformat(timespec="seconds")
                 if self.last_heartbeat_wall else None
             ),
+            "env_frames": self.env_frames,
+            "last_env": self.last_env,
             "gaps": self.gaps,
         }
         tmp = self.stats_path + ".tmp"

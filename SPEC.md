@@ -74,7 +74,7 @@ message. CSI breathing path untouched.
 | T5 | . | AM2302 driver via RMT capture; parse 40-bit frame; checksum | C3,V4,V5 |
 | T6 | . | `env_task`: read LDR each tick, AM2302 ≥2 s cache, build `csi_env_t`, `tcp_send_env_locked()` at `CONFIG_ENV_EMIT_HZ` | V4,V5,V6,V8 |
 | T7 | . | set `sensor_flags` at session build from enabled CONFIG | V7 |
-| T8 | . | `capture.py`: decode MSG_ENV, peek into `stats.json` (env_frames, last temp/rh/ldr) | I.capture,V1 |
+| T8 | x | `capture.py`: decode MSG_ENV, peek into `stats.json` (env_frames, last temp/rh/ldr) | I.capture,V1 |
 | T9 | . | `csi_breathing.load_binary()`: expose env samples alongside CSI | I.loader,V1 |
 | T10 | . | docs: README + CLAUDE.md wire-format + wiring | I.wiring |
 | T11 | . | host: route by `type`, skip unknown, surface env stream from `load_binary()`; expose `temp_c`, `rh`, `ldr_raw`, `ldr_lux?` arrays | V10,V11,V13 |
