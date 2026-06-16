@@ -171,18 +171,24 @@ static void am2302_send_start(void)
  * bit: ~26 µs = 0, ~70 µs = 1. We threshold the high (level==1) duration. */
 static bool am2302_decode(const rmt_symbol_word_t *syms, size_t n)
 {
-    /* Need the ack symbol + 40 data bits. */
-    if (n < 41) return false;
-
-    /* Data bits start right after the sensor's ack (low+high). */
-    const rmt_symbol_word_t *bits = syms + (n - 40);
+    /* Each data bit is a ~50 µs low paired with a high whose width is the bit
+     * value (~26 µs = 0, ~70 µs = 1). Identify data bits by their ~50 µs LOW
+     * half (phase-agnostic) and read the bit from the HIGH half. This skips
+     * whatever sits around the data — the sensor's ~80 µs ack low (when the
+     * RMT catches it), a trailing EOF/idle symbol, and any glitch — without
+     * depending on a fixed index or on the ack being captured at all. */
     uint8_t b[5] = {0};
-    for (int i = 0; i < 40; i++) {
-        rmt_symbol_word_t s = bits[i];
-        uint32_t high_us = s.level0 ? s.duration0 : s.duration1;
+    int nbits = 0;
+    for (size_t i = 0; i < n && nbits < 40; i++) {
+        uint32_t high_us = syms[i].level0 ? syms[i].duration0 : syms[i].duration1;
+        uint32_t low_us  = syms[i].level0 ? syms[i].duration1 : syms[i].duration0;
+        if (low_us < 35 || low_us > 65) continue;   /* not a data bit */
         int bit = (high_us > 45) ? 1 : 0;
-        b[i / 8] = (uint8_t)((b[i / 8] << 1) | bit);
+        b[nbits / 8] = (uint8_t)((b[nbits / 8] << 1) | bit);
+        nbits++;
     }
+    if (nbits < 40) return false;
+
     uint8_t sum = (uint8_t)(b[0] + b[1] + b[2] + b[3]);
     if (sum != b[4]) return false;
 
