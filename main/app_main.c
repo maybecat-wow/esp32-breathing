@@ -433,9 +433,26 @@ static void env_task(void *arg)
     if (hz < 1) hz = 1;
     const TickType_t period = pdMS_TO_TICKS(1000 / hz);
 
+    /* Throttle the human-readable monitor log to ~2 s (AM2302 update cadence)
+       so high emit rates don't flood `idf.py monitor`. */
+    int64_t last_log_us = 0;
+
     while (true) {
         csi_env_t env;
         env_read(&env);   /* off-lock: ADC + (≤ every 2 s) RMT read */
+
+        int64_t now_us = esp_timer_get_time();
+        if (now_us - last_log_us >= 2000000) {
+            last_log_us = now_us;
+            static const char *const am_str[] = {
+                "ok", "crc_err", "no_response", "not_present"
+            };
+            uint8_t st = env.am2302_status & 0x3;
+            ESP_LOGI(TAG, "env: temp=%.1f C  rh=%.1f %%  (am2302:%s)  "
+                          "ldr_raw=%u mv=%u  seq=%u",
+                     env.temp_c_x10 / 10.0f, env.rh_x10 / 10.0f, am_str[st],
+                     env.ldr_raw, env.ldr_mv, env.seq);
+        }
 
         uint8_t buf[sizeof(csi_msg_header_t) + sizeof(csi_env_t)];
         csi_msg_header_t *hdr = (csi_msg_header_t *)buf;
